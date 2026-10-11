@@ -1,0 +1,9 @@
+.prettierignore
+node_modules
+.next
+dist
+.turbo
+build
+coverage
+apps/ai/.venv
+

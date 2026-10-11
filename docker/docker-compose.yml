@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: wearme_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wearme
+      POSTGRES_PASSWORD: wearme
+      POSTGRES_DB: wearme_dev
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wearme -d wearme_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+

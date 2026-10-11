@@ -1,0 +1,11 @@
+{
+  "name": "@wearme/ai",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "PYTHONPATH=. ./.venv/bin/uvicorn app.main:app --reload --host 0.0.0.0 --port 8001",
+    "start": "PYTHONPATH=. ./.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8001",
+    "test": "PYTHONPATH=. ./.venv/bin/pytest"
+  }
+}
+

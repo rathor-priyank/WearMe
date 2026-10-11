@@ -1,0 +1,10 @@
+{
+  "allowBuilds": [
+    "@prisma/client",
+    "@prisma/engines",
+    "prisma",
+    "sharp",
+    "@scarf/scarf"
+  ]
+}
+

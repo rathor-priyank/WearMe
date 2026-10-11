@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand: #7c3aed;
+  --color-brand-light: #a78bfa;
+}
+
+/* Smooth transitions for interactive elements */
+* {
+  @apply transition-colors duration-150;
+}
+

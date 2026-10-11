@@ -1,0 +1,83 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TryOnStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum ClothingCategory {
+  // V1 — upper body only (enforced at API/UI layer, not DB layer)
+  TOP
+  SHIRT
+  TSHIRT
+  JACKET
+  // V2+ — additional categories, expand as model support grows
+  DRESS
+  KURTI
+  SAREE
+  SALWAR_SUIT
+  PANTS
+  JEANS
+  SHORTS
+  SHOES
+  ACCESSORY
+  FULL_OUTFIT
+}
+
+model TryOnJob {
+  id    String      @id @default(uuid())
+  status TryOnStatus @default(PENDING)
+  category ClothingCategory
+
+  // Storage keys — resolved to URLs at runtime by the storage provider.
+  // Never store URLs here; they change when storage provider changes.
+  personImageKey  String
+  garmentImageKey String
+  resultImageKey  String?
+
+  // Image metadata (dimensions, format, size) stored as JSON blobs
+  personImageMeta  Json?
+  garmentImageMeta Json?
+  resultImageMeta  Json?
+
+  // AI tracking — which provider and model processed this job
+  aiProvider     String?
+  aiProviderMeta Json? // e.g. { model: "fashn-v1.5", inferenceMs: 1200 }
+
+  errorMessage String?
+
+  // Future user association — nullable for anonymous V1
+  // userId String?
+  // user   User?   @relation(fields: [userId], references: [id])
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+  // TTL for image retention — a cron job purges jobs past this date
+  expiresAt   DateTime?
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+// V2 — User model (defined but not activated)
+// model User {
+//   id        String     @id @default(uuid())
+//   email     String     @unique
+//   name      String?
+//   jobs      TryOnJob[]
+//   createdAt DateTime   @default(now())
+// }
+

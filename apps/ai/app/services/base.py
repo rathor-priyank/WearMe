@@ -116,6 +116,7 @@ class VTONProvider(ABC):
     Supported implementations:
     - MockProvider ('mock'): Deterministic composite for local development & testing
     - FASHNApiProvider ('fashn-api'): Real virtual try-on inference via official FASHN API v1
+    - HuggingFaceProvider ('huggingface'): Non-commercial virtual try-on via Hugging Face Spaces (yisol/IDM-VTON)
     """
 
     @property

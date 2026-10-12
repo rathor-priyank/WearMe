@@ -1,4 +1,4 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { TryOnStatus } from '@wearme/shared';
 
 export class JobStatusResponseDto {
@@ -10,6 +10,12 @@ export class JobStatusResponseDto {
 
   @ApiProperty({ example: 'TSHIRT' })
   category!: string;
+
+  @ApiPropertyOptional({ example: 'TSHIRT' })
+  subcategory?: string;
+
+  @ApiPropertyOptional({ example: 'clothing' })
+  domain?: string;
 
   @ApiProperty({ example: 'http://localhost:3001/files/jobs/abc/person.jpg', nullable: true })
   personImageUrl?: string;
@@ -23,14 +29,35 @@ export class JobStatusResponseDto {
   @ApiProperty({ example: 'mock', nullable: true })
   aiProvider?: string;
 
+  @ApiPropertyOptional({ example: false })
+  isExperimentalPoc?: boolean;
+
+  @ApiPropertyOptional({ example: true })
+  isMock?: boolean;
+
+  @ApiPropertyOptional({ type: 'object', additionalProperties: true })
+  aiProviderMeta?: Record<string, unknown>;
+
   @ApiProperty({ nullable: true })
   errorMessage?: string;
+
+  @ApiPropertyOptional({ example: false })
+  savedToWardrobe?: boolean;
+
+  @ApiPropertyOptional({ example: 'Studio Namma Indiranagar' })
+  retailerSource?: string;
+
+  @ApiPropertyOptional({ example: 'Classic Oxford Shirt' })
+  productTitle?: string;
 
   @ApiProperty({ example: '2026-10-08T18:00:00.000Z' })
   createdAt!: string;
 
   @ApiProperty({ example: '2026-10-08T18:00:02.000Z', nullable: true })
   completedAt?: string;
+
+  @ApiPropertyOptional({ example: '2026-10-15T18:00:00.000Z' })
+  expiresAt?: string;
 }
 
 export class CreateJobResponseDto {

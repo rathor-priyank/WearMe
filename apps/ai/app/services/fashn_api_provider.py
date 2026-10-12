@@ -21,7 +21,9 @@ from .image_validator import ImageValidationError, validate_and_encode_image
 
 logger = logging.getLogger("wearme.ai.fashn")
 
-SUPPORTED_UPPER_CATEGORIES = {"TOP", "SHIRT", "TSHIRT", "JACKET"}
+SUPPORTED_UPPER_CATEGORIES = {"TOP", "SHIRT", "TSHIRT", "JACKET", "SWEATER", "HOODIE"}
+SUPPORTED_BOTTOM_CATEGORIES = {"TROUSERS", "PANTS", "JEANS", "SKIRT", "SHORTS"}
+SUPPORTED_ONEPIECE_CATEGORIES = {"DRESS", "KURTI", "SALWAR_SUIT", "ETHNIC_WEAR"}
 SUPPORTED_MODELS = {"tryon-v1.6", "tryon-max"}
 ALLOWED_OUTPUT_HOSTS = {"cdn.fashn.ai", "media.fashn.ai"}
 MAX_OUTPUT_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MB
@@ -58,6 +60,7 @@ class FASHNApiProvider(VTONProvider):
         moderation_level: str = "permissive",
         poll_interval_sec: float = 2.0,
         validate_on_init: bool = False,
+        allow_extended_clothing: bool = False,
     ) -> None:
         self._api_key = (api_key or "").strip()
         if timeout_ms is not None and timeout_seconds == 120.0:
@@ -76,6 +79,7 @@ class FASHNApiProvider(VTONProvider):
         self._garment_photo_type = garment_photo_type.strip().lower()
         self._moderation_level = moderation_level.strip().lower()
         self._poll_interval_sec = max(0.05, float(poll_interval_sec))
+        self._allow_extended_clothing = allow_extended_clothing
 
         if validate_on_init:
             self.validate_config()
@@ -99,17 +103,22 @@ class FASHNApiProvider(VTONProvider):
 
     def _map_category(self, category: str) -> str:
         """
-        Map WearMe upper-body garment categories to FASHN's 'tops' category.
+        Map WearMe garment categories to FASHN's 'tops', 'bottoms', or 'one-pieces'.
         Raises VTONValidationError for unsupported categories.
         """
         norm = (category or "").strip().upper()
-        if norm not in SUPPORTED_UPPER_CATEGORIES:
-            raise VTONValidationError(
-                f"Unsupported garment category '{category}'. "
-                f"WearMe V1 supports upper-body categories only: "
-                f"{', '.join(sorted(SUPPORTED_UPPER_CATEGORIES))}."
-            )
-        return "tops"
+        if norm in SUPPORTED_UPPER_CATEGORIES:
+            return "tops"
+        if self._allow_extended_clothing:
+            if norm in SUPPORTED_BOTTOM_CATEGORIES:
+                return "bottoms"
+            if norm in SUPPORTED_ONEPIECE_CATEGORIES:
+                return "one-pieces"
+        raise VTONValidationError(
+            f"Unsupported garment category '{category}'. "
+            f"WearMe V1 supports upper-body categories only: "
+            f"{', '.join(sorted(SUPPORTED_UPPER_CATEGORIES))}."
+        )
 
     def _build_payload(
         self,

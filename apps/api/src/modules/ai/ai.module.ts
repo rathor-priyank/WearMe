@@ -18,6 +18,7 @@ import type { AiConfig } from '../../config/configuration';
             return new FastApiProvider(config, new MockProvider());
           case 'fashn-api':
           case 'huggingface':
+          case 'necklace-poc':
           case 'fal':
           case 'external':
             // Strict delegation to Python FastAPI service (no mock fallback)

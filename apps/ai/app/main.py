@@ -35,23 +35,36 @@ def create_provider(cfg: Settings | None = None) -> VTONProvider:
                 timeout_seconds=active_cfg.effective_timeout_seconds,
                 denoise_steps=active_cfg.hf_denoise_steps,
             )
+        case "necklace-poc":
+            from .services.necklace_poc_provider import NecklacePocProvider
+
+            return NecklacePocProvider(
+                enabled=active_cfg.enable_necklace_poc,
+                timeout_seconds=active_cfg.effective_timeout_seconds,
+            )
         case _:
             raise ValueError(
                 f"Unknown AI_PROVIDER '{active_cfg.ai_provider}'. "
-                "Supported values: 'mock', 'fashn-api', 'huggingface'."
+                "Supported values: 'mock', 'fashn-api', 'huggingface', 'necklace-poc'."
             )
 
 
 def create_app(cfg: Settings | None = None, provider: VTONProvider | None = None) -> FastAPI:
-    active_provider = provider or create_provider(cfg)
+    active_cfg = cfg or settings
+    active_provider = provider or create_provider(active_cfg)
 
     app = FastAPI(
         title="WearMe AI Service",
-        description="Virtual try-on inference service — provider-agnostic (mock | fashn-api | huggingface)",
-        version="1.2.0",
+        description="Virtual try-on inference service — provider-agnostic (mock | fashn-api | huggingface | necklace-poc)",
+        version="1.3.0",
     )
 
-    app.include_router(get_router(active_provider))
+    app.include_router(
+        get_router(
+            active_provider,
+            enable_necklace_poc=active_cfg.enable_necklace_poc,
+        )
+    )
 
     @app.get("/health")
     async def root_health() -> dict:
@@ -59,6 +72,7 @@ def create_app(cfg: Settings | None = None, provider: VTONProvider | None = None
         response: dict = {
             "status": "ok" if ok else "error",
             "provider": active_provider.name,
+            "necklace_poc_enabled": bool(active_cfg.enable_necklace_poc),
         }
         if not ok and active_provider.name == "fashn-api":
             response["detail"] = (

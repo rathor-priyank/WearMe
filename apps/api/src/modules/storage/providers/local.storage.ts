@@ -30,9 +30,16 @@ export class LocalStorageProvider extends StorageProvider {
   }
 
   private fullPath(key: string): string {
-    // Security: prevent directory traversal by resolving and checking prefix
-    const resolved = path.resolve(this.basePath, key);
-    if (!resolved.startsWith(this.basePath)) {
+    const trimmed = key.trim();
+    if (!trimmed || trimmed.includes('\0')) {
+      throw new Error(`Invalid storage key — path traversal detected: ${key}`);
+    }
+    // Security: prevent directory traversal by resolving and checking exact directory boundary
+    const resolved = path.resolve(this.basePath, trimmed);
+    const baseWithSep = this.basePath.endsWith(path.sep)
+      ? this.basePath
+      : `${this.basePath}${path.sep}`;
+    if (!resolved.startsWith(baseWithSep)) {
       throw new Error(`Invalid storage key — path traversal detected: ${key}`);
     }
     return resolved;
@@ -48,6 +55,18 @@ export class LocalStorageProvider extends StorageProvider {
   async download(key: string): Promise<Buffer> {
     const filePath = this.fullPath(key);
     return fs.readFile(filePath);
+  }
+
+  override async copy(
+    sourceKey: string,
+    destinationKey: string,
+    _mimeType = 'image/jpeg',
+  ): Promise<void> {
+    const srcPath = this.fullPath(sourceKey);
+    const destPath = this.fullPath(destinationKey);
+    await fs.mkdir(path.dirname(destPath), { recursive: true });
+    await fs.copyFile(srcPath, destPath);
+    this.logger.debug(`Copied: ${sourceKey} -> ${destinationKey}`);
   }
 
   async getUrl(key: string, _expiresInSeconds?: number): Promise<string> {
@@ -68,11 +87,45 @@ export class LocalStorageProvider extends StorageProvider {
     }
   }
 
+  override async deleteJobDirectory(jobId: string): Promise<void> {
+    const cleanId = jobId.trim();
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(cleanId)) {
+      throw new Error(`Invalid jobId for directory deletion: ${jobId}`);
+    }
+    const dirPath = this.fullPath(`jobs/${cleanId}`);
+    await fs.rm(dirPath, { recursive: true, force: true });
+    this.logger.debug(`Deleted job directory: jobs/${cleanId}`);
+  }
+
+  override async listJobDirectories(): Promise<Array<{ jobId: string; mtimeMs: number }>> {
+    const jobsRoot = path.join(this.basePath, 'jobs');
+    try {
+      const entries = await fs.readdir(jobsRoot, { withFileTypes: true });
+      const results: Array<{ jobId: string; mtimeMs: number }> = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(entry.name)) continue;
+        try {
+          const stat = await fs.stat(path.join(jobsRoot, entry.name));
+          results.push({ jobId: entry.name, mtimeMs: stat.mtimeMs });
+        } catch {
+          // Directory may have been removed concurrently
+        }
+      }
+      return results;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return [];
+      }
+      throw err;
+    }
+  }
+
   async exists(key: string): Promise<boolean> {
     const filePath = this.fullPath(key);
     try {
-      await fs.access(filePath);
-      return true;
+      const stat = await fs.stat(filePath);
+      return stat.isFile() && stat.size > 0;
     } catch {
       return false;
     }
@@ -87,4 +140,3 @@ export class LocalStorageProvider extends StorageProvider {
     }
   }
 }
-

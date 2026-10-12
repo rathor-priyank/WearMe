@@ -9,6 +9,7 @@
     "format": "prettier --write \"**/*.{ts,tsx,js,json,md}\" --ignore-path .gitignore",
     "typecheck": "turbo typecheck",
     "test": "turbo test",
+    "cleanup:storage": "pnpm --filter @wearme/api cleanup:storage",
     "clean": "turbo clean && rm -rf node_modules"
   },
   "devDependencies": {

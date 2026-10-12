@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     hf_space_id: str = "yisol/IDM-VTON"
     hf_denoise_steps: int = 30
 
+    # Experimental PoC processor flag for NECKLACE and PENDANT (default: False)
+    enable_necklace_poc: bool = False
+
     host: str = "0.0.0.0"
     port: int = 8001
 

@@ -43,12 +43,15 @@ export class FastApiProvider extends VirtualTryOnProvider {
 
   async processJob(request: TryOnRequest): Promise<TryOnResult> {
     this.logger.log(
-      `Forwarding job ${request.jobId} (category=${request.category}) to AI service (${this.serviceUrl})`,
+      `Forwarding job ${request.jobId} (category=${request.category}${request.subcategory ? `, subcategory=${request.subcategory}` : ''}) to AI service (${this.serviceUrl})`,
     );
 
     const formData = new FormData();
     formData.append('job_id', request.jobId);
     formData.append('category', request.category);
+    if (request.subcategory) {
+      formData.append('subcategory', request.subcategory);
+    }
 
     const personExt = this.extForMime(request.personMimeType);
     const garmentExt = this.extForMime(request.garmentMimeType);
@@ -97,11 +100,18 @@ export class FastApiProvider extends VirtualTryOnProvider {
           throw new Error(detail);
         }
 
-        // Only fall back to in-process MockProvider when AI_PROVIDER=mock AND the Python service is unreachable
+        // Only fall back to in-process MockProvider when AI_PROVIDER=mock, the Python service is unreachable,
+        // AND the category is an upper-body clothing item (never synthesize mock overlays for jewellery/accessories).
+        const isUpperBodyClothing =
+          request.category !== 'ACCESSORY' &&
+          (!request.subcategory ||
+            ['TOP', 'SHIRT', 'TSHIRT', 'JACKET', 'SWEATER', 'HOODIE'].includes(
+              request.subcategory.toUpperCase(),
+            ));
         const isUnreachable =
           !err.response &&
           (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND' || err.code === 'ERR_NETWORK');
-        if (this.fallbackProvider && isUnreachable) {
+        if (this.fallbackProvider && isUnreachable && isUpperBodyClothing) {
           this.logger.warn(
             `Python AI service unreachable at ${this.serviceUrl}; falling back to in-process ${this.fallbackProvider.name}`,
           );

@@ -5,6 +5,7 @@ import { TryOnService } from './try-on.service';
 @Module({
   controllers: [TryOnController],
   providers: [TryOnService],
+  exports: [TryOnService],
 })
 export class TryOnModule {}
 

@@ -6,8 +6,12 @@ from PIL import Image, UnidentifiedImageError
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
 MIN_DIMENSION_PX = 64
 MAX_DIMENSION_PX = 4096
+MAX_DECOMPRESSED_PIXELS = MAX_DIMENSION_PX * MAX_DIMENSION_PX  # 16,777,216 pixels
 MIN_ASPECT_RATIO = 1.0 / 16.0  # FASHN minimum aspect ratio 1:16
 MAX_ASPECT_RATIO = 16.0  # FASHN maximum aspect ratio 16:1
+
+# Guard against decompression bombs in Pillow before full image decode
+Image.MAX_IMAGE_PIXELS = MAX_DECOMPRESSED_PIXELS
 
 FORMAT_TO_MIME: dict[str, str] = {
     "JPEG": "image/jpeg",
@@ -77,6 +81,11 @@ def validate_and_encode_image(
     try:
         # First pass: verify structural integrity
         with Image.open(io.BytesIO(image_bytes)) as verify_img:
+            w_check, h_check = verify_img.size
+            if w_check * h_check > MAX_DECOMPRESSED_PIXELS:
+                raise Image.DecompressionBombError(
+                    f"Image pixel count ({w_check * h_check}) exceeds limit ({MAX_DECOMPRESSED_PIXELS})."
+                )
             verify_img.verify()
 
         # Second pass: read dimensions and fully decode pixels to catch truncated data
@@ -84,6 +93,10 @@ def validate_and_encode_image(
             img.load()
             fmt = (img.format or "").upper()
             width, height = img.size
+    except Image.DecompressionBombError as exc:
+        raise ImageValidationError(
+            f"{label} exceeds maximum safe pixel dimensions ({MAX_DIMENSION_PX}x{MAX_DIMENSION_PX}px)."
+        ) from exc
     except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
         raise ImageValidationError(
             f"{label} is corrupt or cannot be decoded as a valid image."

@@ -7,6 +7,7 @@ import { appConfig, storageConfig, aiConfig } from './config/configuration';
 import { StorageModule } from './modules/storage/storage.module';
 import { AiModule } from './modules/ai/ai.module';
 import { TryOnModule } from './modules/try-on/try-on.module';
+import { WardrobeModule } from './modules/wardrobe/wardrobe.module';
 import { HealthModule } from './modules/health/health.module';
 import { DatabaseModule } from './modules/database/database.module';
 
@@ -57,6 +58,7 @@ import { DatabaseModule } from './modules/database/database.module';
     StorageModule,
     AiModule,
     TryOnModule,
+    WardrobeModule,
     HealthModule,
   ],
 })

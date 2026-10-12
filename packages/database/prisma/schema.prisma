@@ -17,6 +17,12 @@ enum TryOnStatus {
   FAILED
 }
 
+enum SessionStatus {
+  ANONYMOUS
+  OTP_PENDING
+  UPGRADED
+}
+
 enum ClothingCategory {
   // V1 — upper body only (enforced at API/UI layer, not DB layer)
   TOP
@@ -36,16 +42,69 @@ enum ClothingCategory {
   FULL_OUTFIT
 }
 
+model User {
+  id                  String         @id @default(uuid())
+  phoneE164           String         @unique
+  name                String?
+  phoneVerifiedAt     DateTime       @default(now())
+
+  // Persistent base portrait promoted from the shopper's walk-in try-on session
+  basePersonImageKey  String?
+  basePersonImageMeta Json?
+
+  // Acquisition provenance (which offline store QR brought this user into the B2C flywheel)
+  originStoreId       String?
+  originStoreName     String?
+
+  sessions            TryOnSession[]
+  jobs                TryOnJob[]
+
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  @@index([phoneE164])
+}
+
+model TryOnSession {
+  id            String        @id @default(uuid())
+  // Maps 1:1 to the client's `x-wearme-session-id` header (e.g. "wm_...")
+  sessionToken  String        @unique
+  status        SessionStatus @default(ANONYMOUS)
+
+  // Optional B2B2C walk-in store metadata captured from QR parameters
+  storeId       String?
+  storeName     String?
+
+  // WhatsApp / SMS OTP verification state (hashed, never stored in plaintext)
+  otpPhoneE164  String?
+  otpCodeHash   String?
+  otpExpiresAt  DateTime?
+  otpAttempts   Int           @default(0)
+
+  // Linked persistent User once upgraded
+  userId        String?
+  user          User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  upgradedAt    DateTime?
+
+  jobs          TryOnJob[]
+
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([sessionToken])
+  @@index([userId])
+}
+
 model TryOnJob {
-  id    String      @id @default(uuid())
-  status TryOnStatus @default(PENDING)
-  category ClothingCategory
+  id               String           @id @default(uuid())
+  status           TryOnStatus      @default(PENDING)
+  category         ClothingCategory
 
   // Storage keys — resolved to URLs at runtime by the storage provider.
   // Never store URLs here; they change when storage provider changes.
-  personImageKey  String
-  garmentImageKey String
-  resultImageKey  String?
+  personImageKey   String
+  garmentImageKey  String
+  resultImageKey   String?
 
   // Image metadata (dimensions, format, size) stored as JSON blobs
   personImageMeta  Json?
@@ -53,31 +112,31 @@ model TryOnJob {
   resultImageMeta  Json?
 
   // AI tracking — which provider and model processed this job
-  aiProvider     String?
-  aiProviderMeta Json? // e.g. { model: "fashn-v1.5", inferenceMs: 1200 }
+  aiProvider       String?
+  aiProviderMeta   Json? // e.g. { model: "fashn-v1.5", inferenceMs: 1200 }
 
-  errorMessage String?
+  errorMessage     String?
 
-  // Future user association — nullable for anonymous V1
-  // userId String?
-  // user   User?   @relation(fields: [userId], references: [id])
+  // Flywheel associations — nullable for anonymous V1 sessions
+  sessionId        String?
+  session          TryOnSession?    @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-  completedAt DateTime?
-  // TTL for image retention — a cron job purges jobs past this date
-  expiresAt   DateTime?
+  userId           String?
+  user             User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  savedToWardrobe  Boolean          @default(false)
+  retailerSource   String?
+  productTitle     String?
+
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  completedAt      DateTime?
+  // TTL for image retention — set to NULL when savedToWardrobe=true so saved looks persist
+  expiresAt        DateTime?
 
   @@index([status])
   @@index([createdAt])
+  @@index([sessionId])
+  @@index([userId])
+  @@index([savedToWardrobe])
 }
-
-// V2 — User model (defined but not activated)
-// model User {
-//   id        String     @id @default(uuid())
-//   email     String     @unique
-//   name      String?
-//   jobs      TryOnJob[]
-//   createdAt DateTime   @default(now())
-// }
-

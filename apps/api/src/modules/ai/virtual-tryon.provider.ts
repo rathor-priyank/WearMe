@@ -7,6 +7,7 @@ export interface TryOnRequest {
   personMimeType: string;
   garmentMimeType: string;
   category: ClothingCategory;
+  subcategory?: string;
 }
 
 export interface TryOnResult {

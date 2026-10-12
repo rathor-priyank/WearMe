@@ -15,10 +15,11 @@ export interface StorageConfig {
 }
 
 export interface AiConfig {
-  provider: 'mock' | 'fashn-api' | 'huggingface' | 'fal' | 'external';
+  provider: 'mock' | 'fashn-api' | 'huggingface' | 'necklace-poc' | 'fal' | 'external';
   serviceUrl: string;
   apiKey?: string;
   timeoutMs: number;
+  enableNecklacePoc: boolean;
 }
 
 function resolveAiTimeoutMs(): number {
@@ -58,4 +59,6 @@ export const aiConfig = registerAs('ai', (): AiConfig => ({
   serviceUrl: process.env['AI_SERVICE_URL'] ?? 'http://localhost:8001',
   apiKey: process.env['AI_API_KEY'],
   timeoutMs: resolveAiTimeoutMs(),
+  enableNecklacePoc:
+    process.env['ENABLE_NECKLACE_POC'] === 'true' || process.env['ENABLE_NECKLACE_POC'] === '1',
 }));

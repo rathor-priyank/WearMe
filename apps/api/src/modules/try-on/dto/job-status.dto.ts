@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { TryOnStatus } from '@wearme/shared';
+import { TryOnStatus, type UsageBillingModeType } from '@wearme/shared';
 
 export class JobStatusResponseDto {
   @ApiProperty({ example: '550e8400-e29b-41d4-a716-446655440000' })
@@ -41,6 +41,12 @@ export class JobStatusResponseDto {
   @ApiProperty({ nullable: true })
   errorMessage?: string;
 
+  @ApiPropertyOptional({ example: 'PERSONAL' })
+  billingMode?: UsageBillingModeType;
+
+  @ApiPropertyOptional({ example: 'store_indiranagar_01', nullable: true })
+  sponsoredStoreId?: string | null;
+
   @ApiPropertyOptional({ example: false })
   savedToWardrobe?: boolean;
 
@@ -67,6 +73,12 @@ export class CreateJobResponseDto {
   @ApiProperty({ enum: TryOnStatus })
   status!: TryOnStatus;
 
+  @ApiPropertyOptional({ example: 'PERSONAL' })
+  billingMode?: UsageBillingModeType;
+
+  @ApiPropertyOptional({ example: 'store_indiranagar_01', nullable: true })
+  sponsoredStoreId?: string | null;
+
   @ApiProperty()
   createdAt!: string;
 }
@@ -77,6 +89,9 @@ export class ProcessJobResponseDto {
 
   @ApiProperty({ enum: TryOnStatus })
   status!: TryOnStatus;
+
+  @ApiPropertyOptional({ example: 'PERSONAL' })
+  billingMode?: UsageBillingModeType;
 
   @ApiProperty({ nullable: true })
   resultUrl?: string;

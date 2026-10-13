@@ -23,14 +23,18 @@ import {
   ArrowRight,
   Store,
   KeyRound,
+  Mail,
+  MessageSquare,
+  Lock,
 } from 'lucide-react';
-import type { JobStatusResponse } from '@wearme/shared';
+import type { JobStatusResponse, OtpChannel } from '@wearme/shared';
 import { TryOnStatus } from '@wearme/shared';
 import { tryOnApi } from '@/lib/api-client';
 import {
   getStoredAuthToken,
   getStoredStoreContext,
   getStoredUserProfile,
+  isBrowserAuthenticated,
   setStoredAuthSession,
 } from '@/lib/job-history';
 import { cn } from '@/lib/utils';
@@ -40,6 +44,7 @@ interface TryOnResultProps {
   personPreview: string | null;
   productPreview?: string | null;
   onReset: () => void;
+  onEditInputs?: () => void;
   onDelete?: (jobId: string) => Promise<void>;
 }
 
@@ -51,6 +56,7 @@ export function TryOnResult({
   personPreview,
   productPreview,
   onReset,
+  onEditInputs,
   onDelete,
 }: TryOnResultProps) {
   const router = useRouter();
@@ -62,12 +68,14 @@ export function TryOnResult({
 
   // Network Effect Flywheel state ("Save Look to Wardrobe")
   const [saveStep, setSaveStep] = useState<SaveStep>('idle');
+  const [otpChannel, setOtpChannel] = useState<OtpChannel>('whatsapp');
   const [phoneInput, setPhoneInput] = useState('+91 98765 43210');
+  const [emailInput, setEmailInput] = useState('shopper@wearme.example');
   const [otpInput, setOtpInput] = useState('');
   const [devOtpHint, setDevOtpHint] = useState<string | null>(null);
   const [saveBusy, setSaveBusy] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [verifiedPhone, setVerifiedPhone] = useState<string | null>(null);
+  const [verifiedIdentity, setVerifiedIdentity] = useState<string | null>(null);
   const [storeLabel, setStoreLabel] = useState<string>('Studio Namma Indiranagar');
 
   useEffect(() => {
@@ -75,14 +83,14 @@ export function TryOnResult({
   }, [job.resultUrl, job.jobId]);
 
   useEffect(() => {
-    const existingToken = getStoredAuthToken();
+    const isAuth = isBrowserAuthenticated() || Boolean(getStoredAuthToken());
     const existingProfile = getStoredUserProfile();
     const storeCtx = getStoredStoreContext();
     if (storeCtx?.storeName) {
       setStoreLabel(storeCtx.storeName);
     }
-    if (existingToken && existingProfile) {
-      setVerifiedPhone(existingProfile.phoneE164);
+    if (isAuth && existingProfile) {
+      setVerifiedIdentity(existingProfile.phoneE164 || existingProfile.email || 'Verified Account');
       if (job.savedToWardrobe) {
         setSaveStep('saved');
       }
@@ -96,7 +104,7 @@ export function TryOnResult({
     if (!canDownload || !job.resultUrl) return;
     setDownloading(true);
     try {
-      const res = await fetch(job.resultUrl);
+      const res = await fetch(job.resultUrl, { credentials: 'include' });
       if (!res.ok) {
         setResultImageError(true);
         throw new Error('Failed to fetch generated image');
@@ -126,14 +134,14 @@ export function TryOnResult({
 
   const handleStartSaveToWardrobe = async () => {
     setSaveError(null);
-    const existingToken = getStoredAuthToken();
-    if (existingToken && job.jobId) {
+    const isAuth = isBrowserAuthenticated() || Boolean(getStoredAuthToken());
+    if (isAuth && job.jobId) {
       setSaveBusy(true);
       try {
         await tryOnApi.saveJobToWardrobe(job.jobId);
         setSaveStep('saved');
       } catch {
-        // Token may have expired; fall back to phone/OTP upgrade flow
+        // Session may have expired; fall back to OTP upgrade flow
         setSaveStep('phone');
       } finally {
         setSaveBusy(false);
@@ -143,14 +151,18 @@ export function TryOnResult({
     setSaveStep('phone');
   };
 
+  const activeTarget = otpChannel === 'email' ? emailInput.trim() : phoneInput.trim();
+
   const handleRequestOtp = async () => {
-    if (!phoneInput.trim() || saveBusy) return;
+    if (!activeTarget || saveBusy) return;
     setSaveBusy(true);
     setSaveError(null);
     try {
       const storeCtx = getStoredStoreContext();
       const res = await tryOnApi.requestOtp({
-        phone: phoneInput.trim(),
+        channel: otpChannel,
+        phone: otpChannel !== 'email' ? phoneInput.trim() : undefined,
+        email: otpChannel === 'email' ? emailInput.trim() : undefined,
         storeId: storeCtx?.storeId ?? 'store_indiranagar_01',
         storeName: storeCtx?.storeName ?? storeLabel,
       });
@@ -160,7 +172,7 @@ export function TryOnResult({
       }
       setSaveStep('otp');
     } catch (err: unknown) {
-      setSaveError(err instanceof Error ? err.message : 'Failed to send WhatsApp OTP.');
+      setSaveError(err instanceof Error ? err.message : 'Failed to send verification OTP.');
     } finally {
       setSaveBusy(false);
     }
@@ -173,14 +185,16 @@ export function TryOnResult({
     try {
       const storeCtx = getStoredStoreContext();
       const res = await tryOnApi.upgradeSession({
-        phone: phoneInput.trim(),
+        channel: otpChannel,
+        phone: otpChannel !== 'email' ? phoneInput.trim() : undefined,
+        email: otpChannel === 'email' ? emailInput.trim() : undefined,
         otpCode: otpInput.trim(),
         jobId: job.jobId,
         storeId: storeCtx?.storeId ?? 'store_indiranagar_01',
         storeName: storeCtx?.storeName ?? storeLabel,
       });
       setStoredAuthSession(res.authToken, res.user);
-      setVerifiedPhone(res.user.phoneE164);
+      setVerifiedIdentity(res.user.phoneE164 || res.user.email || 'Verified Account');
       setSaveStep('saved');
       router.push('/my-wardrobe');
     } catch (err: unknown) {
@@ -206,13 +220,24 @@ export function TryOnResult({
           </p>
         </div>
         <div className="mt-2 flex flex-wrap items-center justify-center gap-3">
+          {onEditInputs && (
+            <button
+              type="button"
+              data-testid="adjust-inputs-keep-photos-button"
+              onClick={onEditInputs}
+              className="flex items-center gap-2 rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white hover:bg-violet-500"
+            >
+              <SlidersHorizontal className="h-4 w-4" />
+              Adjust inputs (keep photos)
+            </button>
+          )}
           <button
             type="button"
             onClick={onReset}
             className="flex items-center gap-2 rounded-lg bg-neutral-800 px-4 py-2 text-sm font-medium text-neutral-200 hover:bg-neutral-700"
           >
             <RefreshCw className="h-4 w-4" />
-            Adjust inputs &amp; retry
+            Start fresh try-on
           </button>
           {onDelete && job.jobId && (
             <button
@@ -561,8 +586,12 @@ export function TryOnResult({
                 </div>
                 <p className="mt-1 text-xs leading-relaxed text-neutral-300">
                   {saveStep === 'saved'
-                    ? `Your base portrait and this ${job.subcategory || job.category} look are permanently saved${verifiedPhone ? ` for ${verifiedPhone}` : ''}. Try on items across online B2C brands without re-uploading your photo.`
-                    : 'Verify your WhatsApp number to upgrade this anonymous store session into a persistent Digital Wardrobe. Your base photo is saved so you can try on outfits from cross-platform online brands in 1 click.'}
+                    ? `Your base portrait and this ${job.subcategory || job.category} look are permanently saved${verifiedIdentity ? ` for ${verifiedIdentity}` : ''}. Try on items across online B2C brands without re-uploading your photo.`
+                    : 'Verify via WhatsApp, SMS, or Email OTP to upgrade this anonymous store session into a persistent Digital Wardrobe. Your base photo is saved so you can try on outfits from cross-platform online brands in 1 click.'}
+                </p>
+                <p className="mt-1.5 inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-300/90">
+                  <Lock className="h-3 w-3 shrink-0 text-emerald-400" />
+                  Privacy Boundary: The shopkeeper cannot view your portrait or generated try-on images.
                 </p>
               </div>
             </div>
@@ -580,7 +609,7 @@ export function TryOnResult({
                 ) : (
                   <Smartphone className="h-4 w-4" />
                 )}
-                {verifiedPhone ? 'Save Look to My Wardrobe' : 'Save to Wardrobe (WhatsApp OTP)'}
+                {verifiedIdentity ? 'Save Look to My Wardrobe' : 'Save to Wardrobe (OTP)'}
               </button>
             )}
 
@@ -599,30 +628,69 @@ export function TryOnResult({
 
           {saveStep === 'phone' && (
             <div className="mt-4 border-t border-neutral-800/80 pt-4">
+              {/* Channel selector */}
+              <div className="mb-3 flex flex-wrap gap-2">
+                {(['whatsapp', 'sms', 'email'] as const).map((ch) => (
+                  <button
+                    key={ch}
+                    type="button"
+                    onClick={() => {
+                      setOtpChannel(ch);
+                      setSaveError(null);
+                    }}
+                    className={cn(
+                      'inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors',
+                      otpChannel === ch
+                        ? 'border-emerald-600 bg-emerald-950/70 text-emerald-200'
+                        : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:text-white',
+                    )}
+                  >
+                    {ch === 'whatsapp' && <Smartphone className="h-3.5 w-3.5 text-emerald-400" />}
+                    {ch === 'sms' && <MessageSquare className="h-3.5 w-3.5 text-violet-400" />}
+                    {ch === 'email' && <Mail className="h-3.5 w-3.5 text-sky-400" />}
+                    {ch === 'whatsapp' ? 'WhatsApp OTP' : ch === 'sms' ? 'SMS OTP' : 'Email OTP'}
+                  </button>
+                ))}
+              </div>
+
               <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
                 <div className="flex-1">
                   <label
                     htmlFor="wardrobe-phone-input"
                     className="mb-1.5 block text-xs font-medium text-neutral-300"
                   >
-                    WhatsApp Mobile Number (for instant OTP session upgrade)
+                    {otpChannel === 'email'
+                      ? 'Email Address (for instant OTP session upgrade)'
+                      : `${otpChannel === 'whatsapp' ? 'WhatsApp' : 'SMS'} Mobile Number (for instant OTP session upgrade)`}
                   </label>
-                  <input
-                    id="wardrobe-phone-input"
-                    data-testid="wardrobe-phone-input"
-                    type="tel"
-                    value={phoneInput}
-                    onChange={(e) => setPhoneInput(e.target.value)}
-                    placeholder="+91 98765 43210"
-                    className="w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3.5 py-2.5 text-sm text-white placeholder:text-neutral-500 focus:border-emerald-500 focus:outline-none"
-                  />
+                  {otpChannel === 'email' ? (
+                    <input
+                      id="wardrobe-phone-input"
+                      data-testid="wardrobe-email-input"
+                      type="email"
+                      value={emailInput}
+                      onChange={(e) => setEmailInput(e.target.value)}
+                      placeholder="you@example.com"
+                      className="w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3.5 py-2.5 text-sm text-white placeholder:text-neutral-500 focus:border-emerald-500 focus:outline-none"
+                    />
+                  ) : (
+                    <input
+                      id="wardrobe-phone-input"
+                      data-testid="wardrobe-phone-input"
+                      type="tel"
+                      value={phoneInput}
+                      onChange={(e) => setPhoneInput(e.target.value)}
+                      placeholder="+91 98765 43210"
+                      className="w-full rounded-xl border border-neutral-700 bg-neutral-950 px-3.5 py-2.5 text-sm text-white placeholder:text-neutral-500 focus:border-emerald-500 focus:outline-none"
+                    />
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
                     data-testid="request-otp-button"
                     onClick={handleRequestOtp}
-                    disabled={saveBusy || !phoneInput.trim()}
+                    disabled={saveBusy || !activeTarget}
                     className="inline-flex items-center gap-2 rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-60"
                   >
                     {saveBusy ? (
@@ -630,7 +698,7 @@ export function TryOnResult({
                     ) : (
                       <Smartphone className="h-4 w-4" />
                     )}
-                    Send WhatsApp OTP
+                    Send OTP
                   </button>
                   <button
                     type="button"
@@ -658,7 +726,7 @@ export function TryOnResult({
                 <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-700/60 bg-amber-950/30 px-3.5 py-2 text-xs text-amber-200">
                   <span className="inline-flex items-center gap-1.5">
                     <KeyRound className="h-3.5 w-3.5 text-amber-400" />
-                    Local Dev WhatsApp Sandbox OTP:{' '}
+                    Local Dev Sandbox OTP ({otpChannel.toUpperCase()}):{' '}
                     <code className="rounded bg-amber-900/60 px-1.5 py-0.5 font-mono font-bold text-amber-100">
                       {devOtpHint}
                     </code>
@@ -679,7 +747,7 @@ export function TryOnResult({
                     htmlFor="wardrobe-otp-input"
                     className="mb-1.5 block text-xs font-medium text-neutral-300"
                   >
-                    Enter 6-Digit OTP sent to {phoneInput}
+                    Enter 6-Digit OTP sent to {activeTarget}
                   </label>
                   <input
                     id="wardrobe-otp-input"
@@ -716,7 +784,7 @@ export function TryOnResult({
                     }}
                     className="rounded-xl border border-neutral-800 bg-neutral-900 px-3 py-2.5 text-xs font-medium text-neutral-400 hover:text-white"
                   >
-                    Change Number
+                    Change Channel
                   </button>
                 </div>
               </div>
@@ -744,6 +812,17 @@ export function TryOnResult({
             )}
             Download generated image
           </button>
+          {onEditInputs && (
+            <button
+              type="button"
+              data-testid="adjust-inputs-keep-photos-button"
+              onClick={onEditInputs}
+              className="flex items-center gap-2 rounded-xl border border-violet-700/60 bg-violet-950/40 px-4 py-3 text-sm font-medium text-violet-200 hover:bg-violet-900/60 hover:text-white"
+            >
+              <SlidersHorizontal className="h-4 w-4" />
+              Adjust inputs (keep photos)
+            </button>
+          )}
           <button
             type="button"
             onClick={onReset}

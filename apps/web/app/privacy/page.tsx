@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { SiteHeader } from '@/components/site-header';
 import { SiteFooter } from '@/components/site-footer';
+import { ContextualNavBar } from '@/components/contextual-nav';
 
 const PROVIDERS_PRIVACY = [
   {
@@ -55,6 +56,15 @@ export default function PrivacyPage() {
 
       <main className="flex-1 px-4 py-10 sm:px-6 md:py-12">
         <div className="mx-auto max-w-4xl">
+          <ContextualNavBar
+            backHref="/"
+            backLabel="Back to Home"
+            breadcrumbs={[
+              { label: 'Home', href: '/' },
+              { label: 'Privacy Policy' },
+            ]}
+          />
+
           {/* Header */}
           <div className="mb-10 border-b border-neutral-800/80 pb-6">
             <div className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-emerald-400">
@@ -108,17 +118,26 @@ export default function PrivacyPage() {
               <li className="flex items-start gap-2">
                 <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
                 <span>
-                  <strong>Isolated Job Directory &amp; Path Boundary Enforcement:</strong> Files for
-                  each job are written to{' '}
-                  <code className="text-neutral-200">uploads/jobs/&lt;jobId&gt;/</code> with
-                  allowlisted names (<code className="text-neutral-200">person.*</code>,{' '}
-                  <code className="text-neutral-200">garment.*</code>, and{' '}
-                  <code className="text-neutral-200">result.*</code>). When serving files via{' '}
-                  <code className="text-neutral-200">
-                    GET /api/v1/files/jobs/:jobId/:filename
-                  </code>
-                  , the API validates UUID and filename patterns and enforces strict directory
-                  boundary checks against path traversal.
+                  <strong>Authorized &amp; Signed File Delivery:</strong> Files for each job are
+                  written to <code className="text-neutral-200">uploads/jobs/&lt;jobId&gt;/</code>{' '}
+                  and user portraits to{' '}
+                  <code className="text-neutral-200">uploads/users/&lt;userId&gt;/</code>. When
+                  serving files via{' '}
+                  <code className="text-neutral-200">GET /api/v1/files/jobs/:jobId/:filename</code>{' '}
+                  or{' '}
+                  <code className="text-neutral-200">GET /api/v1/files/users/:userId/:filename</code>,
+                  the API enforces server-side ownership checks (authenticated customer cookie/token,
+                  matching session ID, or HMAC-SHA256 signed URL) and immediately rejects any
+                  shopkeeper-scoped request with <code className="text-neutral-200">403 Forbidden</code>.
+                </span>
+              </li>
+              <li className="flex items-start gap-2">
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" />
+                <span>
+                  <strong>Shopkeeper Isolation Guarantee:</strong> Partner boutiques receive only
+                  aggregated operational counts (scan counts, category engagement, first-touch
+                  attribution). Shopkeepers never receive customer portraits, generated try-on images,
+                  phone numbers, emails, or OTPs.
                 </span>
               </li>
             </ul>
@@ -129,39 +148,49 @@ export default function PrivacyPage() {
             <div className="mb-4 flex items-center gap-2.5">
               <Trash2 className="h-5 w-5 text-emerald-400" />
               <h2 className="text-xl font-bold text-neutral-100">
-                2. Data Retention (`expiresAt`) &amp; Immediate Deletion
+                2. Data Retention (`expiresAt`), Portrait Deletion &amp; Account Erasure
               </h2>
             </div>
             <p className="text-sm leading-relaxed text-neutral-400">
-              Every <code className="text-neutral-200">TryOnJob</code> row in PostgreSQL is created
-              with an <code className="text-neutral-200">expiresAt</code> timestamp set to{' '}
+              Every anonymous <code className="text-neutral-200">TryOnJob</code> row in PostgreSQL is
+              created with an <code className="text-neutral-200">expiresAt</code> timestamp set to{' '}
               <strong>7 days</strong> after creation (<code className="text-neutral-200">IMAGE_RETENTION_DAYS=7</code>).
+              Authenticated customers have full self-service deletion controls at any time:
             </p>
 
-            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            <div className="mt-4 grid gap-4 sm:grid-cols-3">
               <div className="rounded-xl border border-neutral-800 bg-neutral-950 p-4">
                 <h3 className="text-sm font-semibold text-neutral-100">
-                  Immediate Hard Delete (Recommended)
+                  Delete Job &amp; Images
                 </h3>
                 <p className="mt-1.5 text-xs leading-relaxed text-neutral-400">
-                  Clicking <strong>Delete Job</strong> in the Studio or Session History triggers{' '}
-                  <code className="text-neutral-200">DELETE /api/v1/try-on/:jobId</code>. This
-                  immediately deletes all uploaded/generated files, removes the entire{' '}
-                  <code className="text-neutral-200">uploads/jobs/&lt;jobId&gt;/</code> directory
-                  from disk, and deletes the PostgreSQL record.
+                  Clicking <strong>Delete Job</strong> triggers{' '}
+                  <code className="text-neutral-200">DELETE /api/v1/try-on/:jobId</code>, erasing all
+                  uploaded/generated job files, removing{' '}
+                  <code className="text-neutral-200">uploads/jobs/&lt;jobId&gt;/</code> from disk,
+                  and deleting the database record.
                 </p>
               </div>
               <div className="rounded-xl border border-neutral-800 bg-neutral-950 p-4">
                 <h3 className="text-sm font-semibold text-neutral-100">
-                  7-Day Expiration &amp; Orphan Cleanup
+                  Delete Saved Portrait
                 </h3>
                 <p className="mt-1.5 text-xs leading-relaxed text-neutral-400">
-                  Expired jobs (<code className="text-neutral-200">expiresAt &lt;= now</code>) are
-                  automatically purged when accessed and excluded from{' '}
-                  <code className="text-neutral-200">GET /api/v1/try-on/jobs</code>. Operators can
-                  also run <code className="text-neutral-200">pnpm cleanup:storage</code> to purge
-                  all expired database jobs and any orphaned{' '}
-                  <code className="text-neutral-200">uploads/jobs/&lt;jobId&gt;/</code> folders.
+                  Triggering <code className="text-neutral-200">DELETE /api/v1/wardrobe/portrait</code>{' '}
+                  in My Wardrobe or Account Settings permanently removes your{' '}
+                  <code className="text-neutral-200">uploads/users/&lt;userId&gt;/</code> directory
+                  and clears <code className="text-neutral-200">basePersonImageKey</code> while
+                  keeping your account active.
+                </p>
+              </div>
+              <div className="rounded-xl border border-neutral-800 bg-neutral-950 p-4">
+                <h3 className="text-sm font-semibold text-neutral-100">
+                  Full Account Deletion
+                </h3>
+                <p className="mt-1.5 text-xs leading-relaxed text-neutral-400">
+                  Triggering <code className="text-neutral-200">DELETE /api/v1/wardrobe/account</code>{' '}
+                  permanently deletes your saved portrait, all try-on job directories, all linked
+                  sessions, and your user record in a single operation.
                 </p>
               </div>
             </div>

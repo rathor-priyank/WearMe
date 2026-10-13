@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { SiteHeader } from '@/components/site-header';
 import { SiteFooter } from '@/components/site-footer';
+import { ContextualNavBar } from '@/components/contextual-nav';
 import { tryOnApi, buildFallbackCategoriesResponse } from '@/lib/api-client';
 import {
   NECKLACE_POC_SUBCATEGORIES,
@@ -154,6 +155,16 @@ export default function CategoriesPage() {
 
       <main className="flex-1 px-4 py-10 sm:px-6 md:py-12">
         <div className="mx-auto max-w-6xl">
+          <ContextualNavBar
+            backHref="/try-on"
+            backLabel="Back to Try-On"
+            breadcrumbs={[
+              { label: 'Home', href: '/' },
+              { label: 'Try On', href: '/try-on' },
+              { label: 'Supported Categories' },
+            ]}
+          />
+
           {/* Page Header */}
           <div className="mb-8 flex flex-col justify-between gap-4 border-b border-neutral-800/80 pb-6 md:flex-row md:items-end">
             <div>

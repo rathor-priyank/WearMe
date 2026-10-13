@@ -23,6 +23,46 @@ enum SessionStatus {
   UPGRADED
 }
 
+enum UsageBillingMode {
+  STORE_SPONSORED
+  PERSONAL
+  LEGACY_UNKNOWN
+}
+
+enum PartnerStoreStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+  EXPIRED
+}
+
+enum OveragePolicy {
+  BLOCK
+  ALLOW_CONFIGURED
+}
+
+enum ReservationStatus {
+  PENDING
+  CONSUMED
+  RELEASED
+  EXPIRED
+}
+
+enum LedgerEventType {
+  RESERVATION
+  CONSUMPTION
+  RELEASE
+  REFUND
+  ADJUSTMENT
+}
+
 enum ClothingCategory {
   // V1 — upper body only (enforced at API/UI layer, not DB layer)
   TOP
@@ -43,100 +83,274 @@ enum ClothingCategory {
 }
 
 model User {
-  id                  String         @id @default(uuid())
-  phoneE164           String         @unique
+  id                  String               @id @default(uuid())
+  phoneE164           String?              @unique
+  email               String?              @unique
   name                String?
-  phoneVerifiedAt     DateTime       @default(now())
+  phoneVerifiedAt     DateTime?
+  emailVerifiedAt     DateTime?
 
   // Persistent base portrait promoted from the shopper's walk-in try-on session
   basePersonImageKey  String?
   basePersonImageMeta Json?
 
-  // Acquisition provenance (which offline store QR brought this user into the B2C flywheel)
+  // Acquisition provenance (first-touch attribution ONLY; never used as billing authority)
   originStoreId       String?
   originStoreName     String?
 
   sessions            TryOnSession[]
   jobs                TryOnJob[]
+  consumerEntitlement ConsumerEntitlement?
 
-  createdAt           DateTime       @default(now())
-  updatedAt           DateTime       @updatedAt
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
 
   @@index([phoneE164])
+  @@index([email])
 }
 
 model TryOnSession {
-  id            String        @id @default(uuid())
+  id                       String           @id @default(uuid())
   // Maps 1:1 to the client's `x-wearme-session-id` header (e.g. "wm_...")
-  sessionToken  String        @unique
-  status        SessionStatus @default(ANONYMOUS)
+  sessionToken             String           @unique
+  status                   SessionStatus    @default(ANONYMOUS)
 
   // Optional B2B2C walk-in store metadata captured from QR parameters
-  storeId       String?
-  storeName     String?
+  storeId                  String?
+  storeName                String?
 
-  // WhatsApp / SMS OTP verification state (hashed, never stored in plaintext)
-  otpPhoneE164  String?
-  otpCodeHash   String?
-  otpExpiresAt  DateTime?
-  otpAttempts   Int           @default(0)
+  // Bounded Store-Sponsored QR Session state
+  usageMode                UsageBillingMode @default(PERSONAL)
+  sponsoredStoreId         String?
+  sponsoredStartedAt       DateTime?
+  sponsoredExpiresAt       DateTime?
+  lastActivityAt           DateTime         @default(now())
+  inactivityTimeoutMinutes Int              @default(15)
+  maxLifetimeMinutes       Int              @default(60)
+  revokedAt                DateTime?
+  revokeReason             String?
+
+  // Multi-channel OTP verification state (hashed, never stored in plaintext)
+  otpChannel               String?
+  otpTarget                String?
+  otpPhoneE164             String?
+  otpCodeHash              String?
+  otpExpiresAt             DateTime?
+  otpRequestedAt           DateTime?
+  otpAttempts              Int              @default(0)
 
   // Linked persistent User once upgraded
-  userId        String?
-  user          User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
-  upgradedAt    DateTime?
+  userId                   String?
+  user                     User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  upgradedAt               DateTime?
 
-  jobs          TryOnJob[]
+  jobs                     TryOnJob[]
 
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
+  createdAt                DateTime         @default(now())
+  updatedAt                DateTime         @updatedAt
 
   @@index([sessionToken])
   @@index([userId])
+  @@index([sponsoredStoreId])
+}
+
+model PartnerStore {
+  id                     String                     @id @default(uuid())
+  storeId                String                     @unique
+  storeName              String
+  city                   String?
+  verifiedPartner        Boolean                    @default(true)
+  status                 PartnerStoreStatus         @default(ACTIVE)
+  ownerEmail             String?
+  apiKeyHash             String?
+  qrTokenSecret          String?
+  supportedSubcategories String[]                   @default(["tshirt", "shirt", "kurti", "saree", "dress", "jacket"])
+
+  // Legacy/cached credit counters kept in sync with active subscription
+  creditBalance          Int                        @default(100)
+  totalCreditsUsed       Int                        @default(0)
+
+  subscriptions          PartnerStoreSubscription[]
+  reservations           UsageReservation[]
+  ledgerEntries          UsageLedgerEntry[]
+
+  createdAt              DateTime                   @default(now())
+  updatedAt              DateTime                   @updatedAt
+
+  @@index([storeId])
+  @@index([status])
+}
+
+model PartnerStoreSubscription {
+  id                     String             @id @default(uuid())
+  storeId                String
+  store                  PartnerStore       @relation(fields: [storeId], references: [storeId], onDelete: Cascade)
+  planId                 String             @default("GROWTH")
+  planName               String             @default("WearMe Growth")
+  monthlyPriceInr        Int                @default(2499)
+  status                 SubscriptionStatus @default(ACTIVE)
+  periodStart            DateTime           @default(now())
+  periodEnd              DateTime
+  includedCredits        Int                @default(700)
+  consumedCredits        Int                @default(0)
+  reservedCredits        Int                @default(0)
+  failedGenerationsCount Int                @default(0)
+  overagePolicy          OveragePolicy      @default(BLOCK)
+
+  reservations           UsageReservation[]
+  ledgerEntries          UsageLedgerEntry[]
+
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  @@index([storeId, status])
+}
+
+model ConsumerEntitlement {
+  id                     String             @id @default(uuid())
+  userId                 String?            @unique
+  user                   User?              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionToken           String?            @unique
+  planId                 String             @default("PERSONAL_FREE")
+  status                 SubscriptionStatus @default(ACTIVE)
+  periodStart            DateTime           @default(now())
+  periodEnd              DateTime
+  includedCredits        Int                @default(10)
+  consumedCredits        Int                @default(0)
+  reservedCredits        Int                @default(0)
+  failedGenerationsCount Int                @default(0)
+
+  reservations           UsageReservation[]
+  ledgerEntries          UsageLedgerEntry[]
+
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  @@index([userId])
+  @@index([sessionToken])
 }
 
 model TryOnJob {
-  id               String           @id @default(uuid())
-  status           TryOnStatus      @default(PENDING)
-  category         ClothingCategory
+  id                    String             @id @default(uuid())
+  status                TryOnStatus        @default(PENDING)
+  category              ClothingCategory
 
   // Storage keys — resolved to URLs at runtime by the storage provider.
   // Never store URLs here; they change when storage provider changes.
-  personImageKey   String
-  garmentImageKey  String
-  resultImageKey   String?
+  personImageKey        String
+  garmentImageKey       String
+  resultImageKey        String?
 
   // Image metadata (dimensions, format, size) stored as JSON blobs
-  personImageMeta  Json?
-  garmentImageMeta Json?
-  resultImageMeta  Json?
+  personImageMeta       Json?
+  garmentImageMeta      Json?
+  resultImageMeta       Json?
 
   // AI tracking — which provider and model processed this job
-  aiProvider       String?
-  aiProviderMeta   Json? // e.g. { model: "fashn-v1.5", inferenceMs: 1200 }
+  aiProvider            String?
+  aiProviderMeta        Json? // e.g. { model: "fashn-v1.5", inferenceMs: 1200 }
 
-  errorMessage     String?
+  errorMessage          String?
+
+  // Authoritative server-selected billing context & quota tracking
+  billingMode           UsageBillingMode   @default(PERSONAL)
+  idempotencyKey        String?            @unique
+  storeId               String?
+  sponsoredStoreId      String?
+  subscriptionId        String?
+  consumerEntitlementId String?
+  creditReserved        Boolean            @default(false)
+
+  reservation           UsageReservation?
+  ledgerEntries         UsageLedgerEntry[]
 
   // Flywheel associations — nullable for anonymous V1 sessions
-  sessionId        String?
-  session          TryOnSession?    @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  sessionId             String?
+  session               TryOnSession?      @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
-  userId           String?
-  user             User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId                String?
+  user                  User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
 
-  savedToWardrobe  Boolean          @default(false)
-  retailerSource   String?
-  productTitle     String?
+  savedToWardrobe       Boolean            @default(false)
+  retailerSource        String?
+  productTitle          String?
 
-  createdAt        DateTime         @default(now())
-  updatedAt        DateTime         @updatedAt
-  completedAt      DateTime?
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+  completedAt           DateTime?
   // TTL for image retention — set to NULL when savedToWardrobe=true so saved looks persist
-  expiresAt        DateTime?
+  expiresAt             DateTime?
 
   @@index([status])
   @@index([createdAt])
   @@index([sessionId])
   @@index([userId])
+  @@index([storeId])
+  @@index([sponsoredStoreId])
+  @@index([billingMode])
   @@index([savedToWardrobe])
+}
+
+model UsageReservation {
+  id                    String                    @id @default(uuid())
+  jobId                 String                    @unique
+  job                   TryOnJob                  @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  idempotencyKey        String                    @unique
+  billingMode           UsageBillingMode
+  status                ReservationStatus         @default(PENDING)
+  credits               Int                       @default(1)
+
+  storeId               String?
+  store                 PartnerStore?             @relation(fields: [storeId], references: [storeId], onDelete: SetNull)
+  subscriptionId        String?
+  subscription          PartnerStoreSubscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  consumerEntitlementId String?
+  consumerEntitlement   ConsumerEntitlement?      @relation(fields: [consumerEntitlementId], references: [id], onDelete: SetNull)
+
+  userId                String?
+  sessionId             String?
+  providerCostIncurred  Boolean                   @default(false)
+  failureReason         String?
+  expiresAt             DateTime
+  consumedAt            DateTime?
+  releasedAt            DateTime?
+
+  createdAt             DateTime                  @default(now())
+  updatedAt             DateTime                  @updatedAt
+
+  @@index([status, expiresAt])
+  @@index([storeId])
+  @@index([subscriptionId])
+  @@index([consumerEntitlementId])
+}
+
+model UsageLedgerEntry {
+  id                    String                    @id @default(uuid())
+  idempotencyKey        String                    @unique
+  eventType             LedgerEventType
+  billingMode           UsageBillingMode
+  creditsDelta          Int
+
+  jobId                 String?
+  job                   TryOnJob?                 @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  reservationId         String?
+
+  storeId               String?
+  store                 PartnerStore?             @relation(fields: [storeId], references: [storeId], onDelete: SetNull)
+  subscriptionId        String?
+  subscription          PartnerStoreSubscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  consumerEntitlementId String?
+  consumerEntitlement   ConsumerEntitlement?      @relation(fields: [consumerEntitlementId], references: [id], onDelete: SetNull)
+
+  userId                String?
+  sessionId             String?
+  reason                String?
+  metadata              Json?
+
+  createdAt             DateTime                  @default(now())
+
+  @@index([storeId, createdAt])
+  @@index([subscriptionId, createdAt])
+  @@index([consumerEntitlementId, createdAt])
+  @@index([jobId])
 }

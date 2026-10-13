@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { SiteHeader } from '@/components/site-header';
 import { SiteFooter } from '@/components/site-footer';
+import { ContextualNavBar } from '@/components/contextual-nav';
 import { TryOnResult } from '@/components/try-on-result';
 import { tryOnApi } from '@/lib/api-client';
 import {
@@ -134,17 +135,26 @@ export default function HistoryPage() {
     <div className="flex min-h-screen flex-col bg-neutral-950 text-neutral-50">
       <SiteHeader />
 
-      <main className="flex-1 px-4 py-10 sm:px-6 md:py-12">
+      <main className="flex-1 px-4 py-8 sm:px-6 md:py-10">
         <div className="mx-auto max-w-6xl">
+          <ContextualNavBar
+            backHref="/try-on"
+            backLabel="Back to Try-On"
+            breadcrumbs={[
+              { label: 'Try On', href: '/try-on' },
+              { label: 'My Activity' },
+            ]}
+          />
+
           {/* Header */}
           <div className="mb-8 flex flex-col justify-between gap-4 border-b border-neutral-800/80 pb-6 sm:flex-row sm:items-end">
             <div>
               <div className="inline-flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-violet-400">
                 <History className="h-3.5 w-3.5" />
-                Session &amp; Recent Try-On Jobs
+                My Activity &amp; Recent Try-On Jobs
               </div>
               <h1 className="mt-1 text-3xl font-bold tracking-tight sm:text-4xl">
-                Results &amp; Job History
+                My Activity &amp; Job History
               </h1>
               <p className="mt-2 max-w-2xl text-sm text-neutral-400">
                 Inspect completed try-on outputs, check processing status, or permanently delete
@@ -180,17 +190,17 @@ export default function HistoryPage() {
             </div>
           </div>
 
-          {/* Honest Scope Banner */}
+          {/* Scope & Deletion Banner */}
           <div className="mb-6 flex items-start gap-3 rounded-xl border border-neutral-800 bg-neutral-900/50 p-4 text-xs text-neutral-300">
             <Info className="mt-0.5 h-4 w-4 shrink-0 text-violet-400" />
             <div>
               <p className="font-semibold text-neutral-100">
-                Account-Free Session History &amp; Immediate Deletion
+                Customer-Controlled Activity History &amp; Immediate Deletion
               </p>
               <p className="mt-0.5 leading-relaxed text-neutral-400">
-                WearMe does not require user accounts. Recent jobs are synchronized from the local
-                PostgreSQL database (<code className="text-neutral-300">GET /api/v1/try-on/jobs</code>
-                ) and your browser&apos;s session history. Clicking <strong>Delete</strong> calls{' '}
+                Recent jobs are synchronized from your authenticated account and browser session (
+                <code className="text-neutral-300">GET /api/v1/try-on/jobs</code>). Clicking{' '}
+                <strong>Delete</strong> calls{' '}
                 <code className="text-neutral-300">DELETE /api/v1/try-on/:jobId</code> to
                 permanently erase the database record and all image files on disk.
               </p>

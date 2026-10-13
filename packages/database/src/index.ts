@@ -1,11 +1,26 @@
 // Re-export Prisma client and generated types for consumption by other packages.
 // Consumers import from '@wearme/database' instead of directly from '@prisma/client'.
 
-export { PrismaClient, Prisma, SessionStatus } from '@prisma/client';
+export {
+  PrismaClient,
+  Prisma,
+  SessionStatus,
+  UsageBillingMode,
+  PartnerStoreStatus,
+  SubscriptionStatus,
+  OveragePolicy,
+  ReservationStatus,
+  LedgerEventType,
+} from '@prisma/client';
 export type {
   TryOnJob,
   TryOnSession,
   User,
+  PartnerStore,
+  PartnerStoreSubscription,
+  ConsumerEntitlement,
+  UsageReservation,
+  UsageLedgerEntry,
   ClothingCategory,
   TryOnStatus,
 } from '@prisma/client';

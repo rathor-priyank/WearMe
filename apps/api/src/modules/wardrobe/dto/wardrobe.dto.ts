@@ -1,22 +1,44 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsBoolean,
+  IsEmail,
+  IsIn,
   IsNotEmpty,
   IsOptional,
   IsString,
   Matches,
   MaxLength,
+  MinLength,
 } from 'class-validator';
+import type { ContactInquiryCategory, OtpChannel } from '@wearme/shared';
 
 export class RequestOtpDto {
-  @ApiProperty({
-    example: '+919876543210',
-    description: 'WhatsApp phone number (10-digit Indian mobile or E.164 format)',
+  @ApiPropertyOptional({
+    example: 'whatsapp',
+    enum: ['whatsapp', 'sms', 'email'],
+    description: 'Verification channel (defaults to whatsapp)',
   })
+  @IsOptional()
+  @IsIn(['whatsapp', 'sms', 'email'])
+  channel?: OtpChannel;
+
+  @ApiPropertyOptional({
+    example: '+919876543210',
+    description: 'Phone number (required when channel is whatsapp or sms)',
+  })
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
   @MaxLength(24)
-  phone!: string;
+  phone?: string;
+
+  @ApiPropertyOptional({
+    example: 'shopper@example.com',
+    description: 'Email address (required when channel is email)',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(160)
+  email?: string;
 
   @ApiPropertyOptional({
     example: 'store_indiranagar_01',
@@ -29,7 +51,7 @@ export class RequestOtpDto {
 
   @ApiPropertyOptional({
     example: 'Studio Namma Indiranagar',
-    description: 'Optional human-readable walk-in store name',
+    description: 'Optional display hint (resolved against trusted server registry when storeId is registered)',
   })
   @IsOptional()
   @IsString()
@@ -38,18 +60,35 @@ export class RequestOtpDto {
 }
 
 export class UpgradeSessionDto {
-  @ApiProperty({
-    example: '+919876543210',
-    description: 'WhatsApp phone number matching the OTP challenge',
+  @ApiPropertyOptional({
+    example: 'whatsapp',
+    enum: ['whatsapp', 'sms', 'email'],
   })
+  @IsOptional()
+  @IsIn(['whatsapp', 'sms', 'email'])
+  channel?: OtpChannel;
+
+  @ApiPropertyOptional({
+    example: '+919876543210',
+    description: 'Phone number matching the OTP challenge (for whatsapp/sms channels)',
+  })
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
   @MaxLength(24)
-  phone!: string;
+  phone?: string;
+
+  @ApiPropertyOptional({
+    example: 'shopper@example.com',
+    description: 'Email address matching the OTP challenge (for email channel)',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(160)
+  email?: string;
 
   @ApiProperty({
     example: '123456',
-    description: '6-digit WhatsApp OTP verification code',
+    description: '6-digit OTP verification code',
   })
   @IsString()
   @Matches(/^\d{6}$/, { message: 'otpCode must be a 6-digit numeric code.' })
@@ -84,6 +123,15 @@ export class UpgradeSessionDto {
   @IsOptional()
   @IsBoolean()
   replaceBasePortrait?: boolean;
+
+  @ApiPropertyOptional({
+    example: '/my-wardrobe',
+    description: 'Optional safe internal return URL after authentication',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  returnUrl?: string;
 }
 
 export class WardrobeCatalogTryOnDto {
@@ -97,3 +145,36 @@ export class WardrobeCatalogTryOnDto {
   catalogItemId!: string;
 }
 
+export class ContactInquiryDto {
+  @ApiProperty({
+    example: 'partner',
+    enum: ['general', 'partner', 'support', 'privacy', 'security'],
+  })
+  @IsIn(['general', 'partner', 'support', 'privacy', 'security'])
+  category!: ContactInquiryCategory;
+
+  @ApiProperty({ example: 'Aarav Sharma' })
+  @IsString()
+  @MinLength(2)
+  @MaxLength(100)
+  name!: string;
+
+  @ApiProperty({ example: 'aarav@example.com' })
+  @IsEmail()
+  @MaxLength(160)
+  email!: string;
+
+  @ApiPropertyOptional({ example: 'Namma Indie Boutique' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  organization?: string;
+
+  @ApiProperty({
+    example: 'We would like to onboard our Indiranagar boutique for QR try-on.',
+  })
+  @IsString()
+  @MinLength(10)
+  @MaxLength(2000)
+  message!: string;
+}

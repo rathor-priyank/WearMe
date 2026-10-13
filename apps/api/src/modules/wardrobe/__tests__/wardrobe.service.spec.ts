@@ -1,18 +1,28 @@
-import { BadRequestException, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { Response } from 'express';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import { ClothingCategory, TryOnStatus } from '@wearme/shared';
 import { DatabaseService } from '../../database/database.service';
+import { appendSignedFileQuery } from '../../storage/file-token.util';
+import { StorageController } from '../../storage/storage.controller';
 import { StorageProvider } from '../../storage/storage.provider';
 import { TryOnService } from '../../try-on/try-on.service';
 import { WardrobeService } from '../wardrobe.service';
 
-describe('WardrobeService — Network Effect Flywheel (B2B2C -> B2C Upgrade)', () => {
+describe('WardrobeService — Network Effect Flywheel, Multi-Channel OTP & Privacy Boundary', () => {
   let service: WardrobeService;
+  let storageController: StorageController;
   let tmpTraceDir: string;
   let traceLogPath: string;
+  let currentNodeEnv = 'development';
 
   const sessionStore = new Map<string, Record<string, unknown>>();
   const userStore = new Map<string, Record<string, unknown>>();
@@ -48,7 +58,7 @@ describe('WardrobeService — Network Effect Flywheel (B2B2C -> B2C Upgrade)', (
           const merged = existing
             ? { ...existing, ...update, updatedAt: new Date() }
             : {
-                id: 'sess-uuid-1',
+                id: `sess-uuid-${sessionStore.size + 1}`,
                 createdAt: new Date(),
                 updatedAt: new Date(),
                 ...create,
@@ -85,16 +95,66 @@ describe('WardrobeService — Network Effect Flywheel (B2B2C -> B2C Upgrade)', (
           return null;
         },
       ),
+      updateMany: jest.fn(
+        async ({
+          where,
+          data,
+        }: {
+          where: { userId?: string; id?: string; otpCodeHash?: string | null };
+          data: Record<string, unknown>;
+        }) => {
+          let count = 0;
+          for (const [token, sess] of sessionStore.entries()) {
+            const matchUser = where.userId ? sess['userId'] === where.userId : true;
+            const matchId = where.id ? sess['id'] === where.id : true;
+            const matchOtp =
+              where.otpCodeHash !== undefined
+                ? sess['otpCodeHash'] === where.otpCodeHash
+                : true;
+            if (matchUser && matchId && matchOtp) {
+              sessionStore.set(token, { ...sess, ...data, updatedAt: new Date() });
+              count++;
+            }
+          }
+          return { count };
+        },
+      ),
     },
     user: {
-      findUnique: jest.fn(async ({ where }: { where: { phoneE164?: string; id?: string } }) => {
-        if (where.phoneE164) {
-          return userStore.get(where.phoneE164) ?? null;
-        }
-        if (where.id) {
-          return Array.from(userStore.values()).find((u) => u['id'] === where.id) ?? null;
-        }
-        return null;
+      findUnique: jest.fn(
+        async ({ where }: { where: { phoneE164?: string; email?: string; id?: string } }) => {
+          if (where.id) {
+            return userStore.get(where.id) ?? null;
+          }
+          if (where.phoneE164) {
+            return (
+              Array.from(userStore.values()).find((u) => u['phoneE164'] === where.phoneE164) ?? null
+            );
+          }
+          if (where.email) {
+            return (
+              Array.from(userStore.values()).find((u) => u['email'] === where.email) ?? null
+            );
+          }
+          return null;
+        },
+      ),
+      create: jest.fn(async ({ data }: { data: Record<string, unknown> }) => {
+        const id = `user-uuid-${userStore.size + 1}`;
+        const created = {
+          id,
+          phoneE164: null,
+          email: null,
+          phoneVerifiedAt: null,
+          emailVerifiedAt: null,
+          basePersonImageKey: null,
+          originStoreId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          ...data,
+        };
+        userStore.set(id, created);
+        return created;
       }),
       upsert: jest.fn(
         async ({
@@ -102,20 +162,25 @@ describe('WardrobeService — Network Effect Flywheel (B2B2C -> B2C Upgrade)', (
           create,
           update,
         }: {
-          where: { phoneE164: string };
+          where: { phoneE164?: string; email?: string };
           create: Record<string, unknown>;
           update: Record<string, unknown>;
         }) => {
-          const existing = userStore.get(where.phoneE164);
+          const existing = Array.from(userStore.values()).find(
+            (u) =>
+              (where.phoneE164 && u['phoneE164'] === where.phoneE164) ||
+              (where.email && u['email'] === where.email),
+          );
+          const id = existing ? String(existing['id']) : `user-uuid-${userStore.size + 1}`;
           const merged = existing
             ? { ...existing, ...update, updatedAt: new Date() }
             : {
-                id: 'user-uuid-1',
+                id,
                 createdAt: new Date(),
                 updatedAt: new Date(),
                 ...create,
               };
-          userStore.set(where.phoneE164, merged);
+          userStore.set(id, merged);
           return merged;
         },
       ),
@@ -127,16 +192,18 @@ describe('WardrobeService — Network Effect Flywheel (B2B2C -> B2C Upgrade)', (
           where: { id: string };
           data: Record<string, unknown>;
         }) => {
-          for (const [phone, user] of userStore.entries()) {
-            if (user['id'] === where.id) {
-              const updated = { ...user, ...data, updatedAt: new Date() };
-              userStore.set(phone, updated);
-              return updated;
-            }
-          }
-          return null;
+          const existing = userStore.get(where.id);
+          if (!existing) return null;
+          const updated = { ...existing, ...data, updatedAt: new Date() };
+          userStore.set(where.id, updated);
+          return updated;
         },
       ),
+      delete: jest.fn(async ({ where }: { where: { id: string } }) => {
+        const existing = userStore.get(where.id) ?? null;
+        userStore.delete(where.id);
+        return existing;
+      }),
     },
     tryOnJob: {
       findMany: jest.fn(async () => Array.from(jobStore.values())),
@@ -179,6 +246,20 @@ describe('WardrobeService — Network Effect Flywheel (B2B2C -> B2C Upgrade)', (
           return { count };
         },
       ),
+      delete: jest.fn(async ({ where }: { where: { id: string } }) => {
+        const existing = jobStore.get(where.id) ?? null;
+        jobStore.delete(where.id);
+        return existing;
+      }),
+      deleteMany: jest.fn(async ({ where }: { where: { id: { in: string[] } } }) => {
+        let count = 0;
+        for (const id of where.id.in) {
+          if (jobStore.delete(id)) {
+            count++;
+          }
+        }
+        return { count };
+      }),
     },
     $transaction: jest.fn(
       async (cb: (tx: unknown) => Promise<unknown>): Promise<unknown> => cb(mockDb),
@@ -232,13 +313,15 @@ describe('WardrobeService — Network Effect Flywheel (B2B2C -> B2C Upgrade)', (
 
   const mockConfig = {
     get: jest.fn((key: string) => {
-      if (key === 'app.nodeEnv') return 'development';
+      if (key === 'app.nodeEnv') return currentNodeEnv;
       return undefined;
     }),
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    currentNodeEnv = 'development';
+    delete process.env['NODE_ENV'];
     sessionStore.clear();
     userStore.clear();
     jobStore.clear();
@@ -253,10 +336,16 @@ describe('WardrobeService — Network Effect Flywheel (B2B2C -> B2C Upgrade)', (
       mockTryOnService as unknown as TryOnService,
       mockConfig as unknown as ConfigService,
     );
+
+    storageController = new StorageController(
+      mockStorage,
+      mockDb as unknown as DatabaseService,
+    );
   });
 
   afterEach(async () => {
     delete process.env['SESSION_UPGRADE_TRACE_LOG_PATH'];
+    delete process.env['NODE_ENV'];
     if (tmpTraceDir) {
       await fs.rm(tmpTraceDir, { recursive: true, force: true });
     }
@@ -579,5 +668,341 @@ describe('WardrobeService — Network Effect Flywheel (B2B2C -> B2C Upgrade)', (
 
     const sessAfterBadAttempt = sessionStore.get(sessionToken)!;
     expect(sessAfterBadAttempt['otpAttempts']).toBe(1);
+  });
+
+  it('supports Email and SMS OTP channels, links email + phone to the same account, and enforces cooldown, expiry, one-time use, and brute-force lockout', async () => {
+    const sessionToken = 'wm_multichannel_otp_session_01';
+
+    // 1. Email OTP challenge
+    const emailChallenge = await service.requestOtp(sessionToken, {
+      channel: 'email',
+      email: 'Shopper.One@Example.com',
+    });
+    expect(emailChallenge.channel).toBe('email');
+    expect(emailChallenge.destination).toBe('shopper.one@example.com');
+    expect(emailChallenge.devOtpPreview).toBe('123456');
+
+    // 2. Resend cooldown enforced (< 30 seconds)
+    await expect(
+      service.requestOtp(sessionToken, {
+        channel: 'email',
+        email: 'shopper.one@example.com',
+      }),
+    ).rejects.toThrow(BadRequestException);
+
+    // 3. Upgrade session via Email OTP
+    const emailUpgrade = await service.upgradeSession(sessionToken, {
+      channel: 'email',
+      email: 'shopper.one@example.com',
+      otpCode: '123456',
+      returnUrl: '/try-on?storeId=store_indiranagar_01',
+    });
+    expect(emailUpgrade.user.email).toBe('shopper.one@example.com');
+    expect(emailUpgrade.redirectTo).toBe('/try-on?storeId=store_indiranagar_01');
+
+    // 4. Reused OTP must fail immediately (one-time consumption)
+    await expect(
+      service.upgradeSession(sessionToken, {
+        channel: 'email',
+        email: 'shopper.one@example.com',
+        otpCode: '123456',
+      }),
+    ).rejects.toThrow(UnauthorizedException);
+
+    // 5. Link SMS phone number to the SAME session/account after cooldown expires
+    const sessRecord = sessionStore.get(sessionToken)!;
+    sessRecord['otpRequestedAt'] = new Date(Date.now() - 60_000);
+    sessionStore.set(sessionToken, sessRecord);
+
+    const smsChallenge = await service.requestOtp(sessionToken, {
+      channel: 'sms',
+      phone: '9888877777',
+    });
+    expect(smsChallenge.channel).toBe('sms');
+    expect(smsChallenge.phoneE164).toBe('+919888877777');
+
+    const linkedUpgrade = await service.upgradeSession(sessionToken, {
+      channel: 'sms',
+      phone: '9888877777',
+      otpCode: '123456',
+      returnUrl: 'https://evil.example.com/phish', // Open redirect attempt must fall back to /my-wardrobe
+    });
+    expect(linkedUpgrade.user.id).toBe(emailUpgrade.user.id);
+    expect(linkedUpgrade.user.email).toBe('shopper.one@example.com');
+    expect(linkedUpgrade.user.phoneE164).toBe('+919888877777');
+    expect(linkedUpgrade.redirectTo).toBe('/my-wardrobe');
+
+    // 6. Expired OTP rejection
+    const expiredSessToken = 'wm_expired_otp_session_02';
+    await service.requestOtp(expiredSessToken, {
+      channel: 'whatsapp',
+      phone: '9777766666',
+    });
+    const expSess = sessionStore.get(expiredSessToken)!;
+    expSess['otpExpiresAt'] = new Date(Date.now() - 1_000);
+    sessionStore.set(expiredSessToken, expSess);
+
+    await expect(
+      service.upgradeSession(expiredSessToken, {
+        channel: 'whatsapp',
+        phone: '9777766666',
+        otpCode: '123456',
+      }),
+    ).rejects.toThrow(UnauthorizedException);
+
+    // 7. Brute-force lockout after 5 wrong attempts
+    const lockSessToken = 'wm_lockout_otp_session_03';
+    await service.requestOtp(lockSessToken, {
+      channel: 'whatsapp',
+      phone: '9666655555',
+    });
+    for (let i = 0; i < 5; i++) {
+      await expect(
+        service.upgradeSession(lockSessToken, {
+          channel: 'whatsapp',
+          phone: '9666655555',
+          otpCode: '000000',
+        }),
+      ).rejects.toThrow(UnauthorizedException);
+    }
+    // 6th attempt even with right code must be blocked due to lockout
+    await expect(
+      service.upgradeSession(lockSessToken, {
+        channel: 'whatsapp',
+        phone: '9666655555',
+        otpCode: '123456',
+      }),
+    ).rejects.toThrow(UnauthorizedException);
+  });
+
+  it('disables dev OTP preview and requires live provider credentials when NODE_ENV=production', async () => {
+    currentNodeEnv = 'production';
+    process.env['NODE_ENV'] = 'production';
+
+    const channels = service.getAuthChannels();
+    expect(channels.channels.every((c) => c.isLiveConfigured === false)).toBe(true);
+
+    await expect(
+      service.requestOtp('wm_prod_session_0001', {
+        channel: 'whatsapp',
+        phone: '9876543210',
+      }),
+    ).rejects.toThrow(ServiceUnavailableException);
+  });
+
+  it('enforces strict Customer/Shopkeeper privacy isolation across WardrobeService and StorageController', async () => {
+    const customerSession = 'wm_customer_private_sess_01';
+    const jobId = '44444444-5555-4666-8777-888888888888';
+    const realUserId = '99999999-8888-4777-8666-555555555555';
+
+    mockDb.user.upsert.mockImplementationOnce(
+      async ({ create }: { create: Record<string, unknown> }) => {
+        const created = {
+          id: realUserId,
+          phoneE164: null,
+          email: null,
+          phoneVerifiedAt: null,
+          emailVerifiedAt: null,
+          basePersonImageKey: null,
+          originStoreId: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          ...create,
+        };
+        userStore.set(realUserId, created);
+        return created;
+      },
+    );
+
+    jobStore.set(jobId, {
+      id: jobId,
+      status: 'COMPLETED',
+      category: ClothingCategory.TSHIRT,
+      personImageKey: `jobs/${jobId}/person.jpg`,
+      garmentImageKey: `jobs/${jobId}/garment.jpg`,
+      resultImageKey: `jobs/${jobId}/result.jpg`,
+      personImageMeta: { sessionId: customerSession, mimeType: 'image/jpeg' },
+      garmentImageMeta: { sessionId: customerSession, subcategory: 'TSHIRT' },
+      savedToWardrobe: false,
+      expiresAt: new Date(Date.now() + 7 * 86400_000),
+      createdAt: new Date(),
+    });
+
+    // Tampered storeName in request is ignored in favor of server-trusted PARTNER_STORE_REGISTRY
+    await service.requestOtp(customerSession, {
+      channel: 'whatsapp',
+      phone: '9876543210',
+      storeId: 'store_indiranagar_01',
+      storeName: 'MALICIOUS PHISHING BOUTIQUE NAME',
+    });
+
+    const upgraded = await service.upgradeSession(customerSession, {
+      channel: 'whatsapp',
+      phone: '9876543210',
+      otpCode: '123456',
+      jobId,
+      storeId: 'store_indiranagar_01',
+      storeName: 'MALICIOUS PHISHING BOUTIQUE NAME',
+    });
+
+    const savedJob = jobStore.get(jobId)!;
+    // Server resolved the official verified boutique name, NOT the tampered URL parameter
+    expect(savedJob['retailerSource']).toBe('Studio Namma Indiranagar');
+
+    // 1. Shopkeeper cannot access customer's /wardrobe even if they somehow pass a token alongside partner headers
+    await expect(
+      service.getWardrobe(
+        `Bearer ${upgraded.authToken}`,
+        undefined,
+        customerSession,
+        undefined,
+        'store_indiranagar_01',
+        undefined,
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    // 2. Shopkeeper cannot access customer's job images or base portrait via StorageController
+    const mockRes = {
+      set: jest.fn(),
+      send: jest.fn(),
+    } as unknown as Response;
+
+    await expect(
+      storageController.serveFile(
+        jobId,
+        'person.jpg',
+        mockRes,
+        undefined,
+        undefined,
+        'store_indiranagar_01', // ?storeId= query attempt
+        customerSession,
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    await expect(
+      storageController.serveFile(
+        jobId,
+        'result.jpg',
+        mockRes,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        'store_indiranagar_01', // x-wearme-partner-store-id header
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    await expect(
+      storageController.serveUserFile(
+        upgraded.user.id,
+        'base_portrait.jpg',
+        mockRes,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        'store_indiranagar_01',
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    // 3. Another customer cannot access this customer's job file or portrait file
+    await expect(
+      storageController.serveFile(
+        jobId,
+        'person.jpg',
+        mockRes,
+        undefined,
+        undefined,
+        undefined,
+        'wm_other_customer_session_99',
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    await expect(
+      storageController.serveUserFile(
+        upgraded.user.id,
+        'base_portrait.jpg',
+        mockRes,
+        undefined,
+        undefined,
+        undefined,
+        'wm_other_customer_session_99',
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    // 4. Owning customer CAN access their job file and portrait file via Cookie or signed URL
+    await storageController.serveFile(
+      jobId,
+      'result.jpg',
+      mockRes,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      `wearme_auth_token_v1=${encodeURIComponent(upgraded.authToken)}`,
+    );
+    expect(mockRes.send).toHaveBeenCalledTimes(1);
+
+    const signedUrl = appendSignedFileQuery(
+      `http://localhost:3001/api/v1/files/users/${upgraded.user.id}/base_portrait.jpg`,
+      `users/${upgraded.user.id}/base_portrait.jpg`,
+    );
+    const parsedSigned = new URL(signedUrl);
+    await storageController.serveUserFile(
+      upgraded.user.id,
+      'base_portrait.jpg',
+      mockRes,
+      parsedSigned.searchParams.get('exp') ?? undefined,
+      parsedSigned.searchParams.get('sig') ?? undefined,
+    );
+    expect(mockRes.send).toHaveBeenCalledTimes(2);
+
+    // Tampered signature must fail with 403 Forbidden
+    await expect(
+      storageController.serveUserFile(
+        upgraded.user.id,
+        'base_portrait.jpg',
+        mockRes,
+        parsedSigned.searchParams.get('exp') ?? undefined,
+        'tampered_sig_value',
+      ),
+    ).rejects.toThrow(ForbiddenException);
+
+    // 5. Partner store analytics returns ONLY aggregated numbers and zero customer photos/PII
+    const analytics = await service.getPartnerStoreAnalytics('store_indiranagar_01');
+    expect(analytics.storeId).toBe('store_indiranagar_01');
+    expect(analytics.privacyNotice).toContain('strictly isolated and inaccessible to shop partners');
+    expect(JSON.stringify(analytics)).not.toContain('+919876543210');
+    expect(JSON.stringify(analytics)).not.toContain('person.jpg');
+    expect(JSON.stringify(analytics)).not.toContain('base_portrait.jpg');
+
+    // 6. Customer can delete their saved portrait and then delete their entire account
+    const delPortrait = await service.deleteUserPortrait(
+      `Bearer ${upgraded.authToken}`,
+      undefined,
+      customerSession,
+    );
+    expect(delPortrait.deleted).toBe(true);
+    expect(mockStorage.delete).toHaveBeenCalledWith(
+      `users/${upgraded.user.id}/base_portrait.jpg`,
+    );
+
+    const delAccount = await service.deleteUserAccount(
+      `Bearer ${upgraded.authToken}`,
+      undefined,
+      customerSession,
+    );
+    expect(delAccount.deleted).toBe(true);
+    expect(delAccount.deletedJobsCount).toBe(1);
+    expect(userStore.has(upgraded.user.id)).toBe(false);
+    expect(jobStore.has(jobId)).toBe(false);
   });
 });

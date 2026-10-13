@@ -26,7 +26,7 @@ async function bootstrap() {
     }),
   );
 
-  // CORS — only allow configured frontend origins
+  // CORS — only allow configured frontend origins with HttpOnly cookie credentials
   app.enableCors({
     origin: config.corsOrigins,
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
@@ -35,8 +35,11 @@ async function bootstrap() {
       'Authorization',
       'x-wearme-session-id',
       'x-wearme-auth-token',
+      'x-wearme-csrf',
+      'x-wearme-partner-store-id',
+      'x-wearme-partner-key',
     ],
-    credentials: false,
+    credentials: true,
   });
 
   // Global validation pipe — strips unknown properties, transforms types
@@ -54,23 +57,26 @@ async function bootstrap() {
   // Global API prefix
   app.setGlobalPrefix('api/v1');
 
-  // Swagger / OpenAPI
-  const swaggerConfig = new DocumentBuilder()
-    .setTitle('WearMe API')
-    .setDescription('Virtual try-on platform API — V1')
-    .setVersion('1.0')
-    .addTag('try-on', 'Virtual try-on job management')
-    .addTag('health', 'Service health checks')
-    .build();
+  // Swagger / OpenAPI — disabled in production unless explicitly enabled
+  if (config.nodeEnv !== 'production') {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('WearMe API')
+      .setDescription('Virtual try-on platform API — V1')
+      .setVersion('1.0')
+      .addTag('try-on', 'Virtual try-on job management')
+      .addTag('auth & wardrobe', 'Customer OTP authentication and private wardrobe')
+      .addTag('health', 'Service health checks')
+      .build();
 
-  const document = SwaggerModule.createDocument(app, swaggerConfig);
-  SwaggerModule.setup('api/docs', app, document, {
-    swaggerOptions: { persistAuthorization: true },
-  });
+    const document = SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup('api/docs', app, document, {
+      swaggerOptions: { persistAuthorization: true },
+    });
+    logger.log(`📚 Swagger docs at http://localhost:${config.port}/api/docs`, 'Bootstrap');
+  }
 
   await app.listen(config.port);
   logger.log(`🚀 API running on http://localhost:${config.port}/api/v1`, 'Bootstrap');
-  logger.log(`📚 Swagger docs at http://localhost:${config.port}/api/docs`, 'Bootstrap');
 }
 
 bootstrap();

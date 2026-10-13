@@ -7,6 +7,7 @@ import {
   Body,
   Query,
   Headers,
+  Res,
   UseInterceptors,
   UploadedFiles,
   HttpCode,
@@ -25,6 +26,7 @@ import {
   ApiResponse,
 } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import type { Response } from 'express';
 import { memoryStorage } from 'multer';
 import type { CategoriesResponse, JobHistoryResponse } from '@wearme/shared';
 import { TryOnService } from './try-on.service';
@@ -36,6 +38,13 @@ import {
 } from './dto/job-status.dto';
 import { ConfigService } from '@nestjs/config';
 import type { StorageConfig } from '../../config/configuration';
+import {
+  extractAuthTokenFromCookieHeader,
+  extractSessionIdFromCookieHeader,
+  verifyCustomerAuthToken,
+} from '../storage/file-token.util';
+
+const SAFE_SESSION_ID_REGEX = /^[a-zA-Z0-9_-]{8,128}$/;
 
 @ApiTags('try-on')
 @Controller('try-on')
@@ -48,6 +57,40 @@ export class TryOnController {
   ) {
     const storage = this.configService.get<StorageConfig>('storage')!;
     this.maxFileSizeBytes = storage.maxFileSizeMb * 1024 * 1024;
+  }
+
+  private resolveAndBindSessionCookie(
+    headerSessionId?: string,
+    cookieHeader?: string,
+    res?: Response,
+  ): string | undefined {
+    const candidate =
+      headerSessionId && SAFE_SESSION_ID_REGEX.test(headerSessionId.trim())
+        ? headerSessionId.trim()
+        : extractSessionIdFromCookieHeader(cookieHeader);
+    if (candidate && SAFE_SESSION_ID_REGEX.test(candidate) && res?.cookie) {
+      res.cookie('wearme_session_id_v1', candidate, {
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: process.env['NODE_ENV'] === 'production',
+        path: '/',
+        maxAge: 7 * 24 * 60 * 60 * 1000,
+      });
+    }
+    return candidate;
+  }
+
+  private resolveAuthenticatedUserId(
+    authorizationHeader?: string,
+    authTokenHeader?: string,
+    cookieHeader?: string,
+  ): string | null {
+    const rawToken =
+      authorizationHeader ??
+      authTokenHeader ??
+      extractAuthTokenFromCookieHeader(cookieHeader);
+    const verified = verifyCustomerAuthToken(rawToken);
+    return verified?.sub ?? null;
   }
 
   @Get('categories')
@@ -63,7 +106,7 @@ export class TryOnController {
   @Get('jobs')
   @ApiOperation({
     summary:
-      'List recent non-expired try-on jobs for the active browser session (filtered by comma-separated job IDs or session header)',
+      'List recent non-expired try-on jobs for the authenticated user or active browser session',
   })
   @ApiQuery({
     name: 'ids',
@@ -74,8 +117,18 @@ export class TryOnController {
   async listJobs(
     @Query('ids') ids?: string,
     @Headers('x-wearme-session-id') sessionId?: string,
+    @Headers('authorization') authorizationHeader?: string,
+    @Headers('x-wearme-auth-token') authTokenHeader?: string,
+    @Headers('cookie') cookieHeader?: string,
+    @Res({ passthrough: true }) res?: Response,
   ): Promise<JobHistoryResponse> {
-    return this.tryOnService.listRecentJobs(ids, sessionId);
+    const effectiveSession = this.resolveAndBindSessionCookie(sessionId, cookieHeader, res);
+    const userId = this.resolveAuthenticatedUserId(
+      authorizationHeader,
+      authTokenHeader,
+      cookieHeader,
+    );
+    return this.tryOnService.listRecentJobs(ids, effectiveSession, userId);
   }
 
   @Post('upload')
@@ -124,11 +177,21 @@ export class TryOnController {
           description:
             'Optional specific wearable subcategory (e.g. TSHIRT, SHIRT, SWEATER, HOODIE, JACKET, TOP, NECKLACE, PENDANT)',
         },
+        storeId: {
+          type: 'string',
+          description:
+            'Optional storeId hint; only honored when backed by an active server-side STORE_SPONSORED TryOnSession',
+        },
+        idempotencyKey: {
+          type: 'string',
+          description: 'Optional idempotency key',
+        },
       },
     },
   })
   @ApiResponse({ status: 201, type: CreateJobResponseDto })
   @ApiResponse({ status: 400, description: 'Invalid file type, missing file, or invalid category' })
+  @ApiResponse({ status: 403, description: 'Expired store-sponsored session or exhausted quota' })
   @ApiResponse({ status: 413, description: 'File too large (max 10 MB)' })
   async upload(
     @UploadedFiles()
@@ -138,16 +201,32 @@ export class TryOnController {
     },
     @Body() dto: CreateTryOnJobDto,
     @Headers('x-wearme-session-id') sessionId?: string,
+    @Headers('authorization') authorizationHeader?: string,
+    @Headers('x-wearme-auth-token') authTokenHeader?: string,
+    @Headers('x-idempotency-key') idempotencyKeyHeader?: string,
+    @Headers('cookie') cookieHeader?: string,
+    @Res({ passthrough: true }) res?: Response,
   ): Promise<CreateJobResponseDto> {
     const personFile = files?.personImage?.[0];
     const garmentFile = files?.garmentImage?.[0];
+    const effectiveSession = this.resolveAndBindSessionCookie(sessionId, cookieHeader, res);
+    const userId = this.resolveAuthenticatedUserId(
+      authorizationHeader,
+      authTokenHeader,
+      cookieHeader,
+    );
 
     return this.tryOnService.createJob(
       personFile as Express.Multer.File,
       garmentFile as Express.Multer.File,
       dto.category,
       dto.subcategory,
-      sessionId,
+      effectiveSession,
+      dto.storeId,
+      {
+        userId,
+        idempotencyKey: idempotencyKeyHeader ?? dto.idempotencyKey,
+      },
     );
   }
 
@@ -156,27 +235,47 @@ export class TryOnController {
   @ApiOperation({ summary: 'Trigger AI inference for a job (synchronous in V1)' })
   @ApiParam({ name: 'jobId', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, type: ProcessJobResponseDto })
-  @ApiResponse({ status: 403, description: 'Job belongs to another session' })
+  @ApiResponse({ status: 403, description: 'Job belongs to another user or session' })
   @ApiResponse({ status: 404, description: 'Job not found or expired' })
   @ApiResponse({ status: 500, description: 'AI processing failed' })
   async process(
     @Param('jobId', ParseUUIDPipe) jobId: string,
     @Headers('x-wearme-session-id') sessionId?: string,
+    @Headers('authorization') authorizationHeader?: string,
+    @Headers('x-wearme-auth-token') authTokenHeader?: string,
+    @Headers('cookie') cookieHeader?: string,
+    @Res({ passthrough: true }) res?: Response,
   ): Promise<ProcessJobResponseDto> {
-    return this.tryOnService.processJob(jobId, sessionId);
+    const effectiveSession = this.resolveAndBindSessionCookie(sessionId, cookieHeader, res);
+    const userId = this.resolveAuthenticatedUserId(
+      authorizationHeader,
+      authTokenHeader,
+      cookieHeader,
+    );
+    return this.tryOnService.processJob(jobId, effectiveSession, userId);
   }
 
   @Get(':jobId/status')
   @ApiOperation({ summary: 'Get current job status and image URLs' })
   @ApiParam({ name: 'jobId', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, type: JobStatusResponseDto })
-  @ApiResponse({ status: 403, description: 'Job belongs to another session' })
+  @ApiResponse({ status: 403, description: 'Job belongs to another user or session' })
   @ApiResponse({ status: 404, description: 'Job not found or expired' })
   async getStatus(
     @Param('jobId', ParseUUIDPipe) jobId: string,
     @Headers('x-wearme-session-id') sessionId?: string,
+    @Headers('authorization') authorizationHeader?: string,
+    @Headers('x-wearme-auth-token') authTokenHeader?: string,
+    @Headers('cookie') cookieHeader?: string,
+    @Res({ passthrough: true }) res?: Response,
   ): Promise<JobStatusResponseDto> {
-    return this.tryOnService.getJobStatus(jobId, sessionId);
+    const effectiveSession = this.resolveAndBindSessionCookie(sessionId, cookieHeader, res);
+    const userId = this.resolveAuthenticatedUserId(
+      authorizationHeader,
+      authTokenHeader,
+      cookieHeader,
+    );
+    return this.tryOnService.getJobStatus(jobId, effectiveSession, userId);
   }
 
   @Delete(':jobId')
@@ -184,12 +283,21 @@ export class TryOnController {
   @ApiOperation({ summary: 'Delete a job and all associated images' })
   @ApiParam({ name: 'jobId', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 204, description: 'Job and images deleted' })
-  @ApiResponse({ status: 403, description: 'Job belongs to another session' })
+  @ApiResponse({ status: 403, description: 'Job belongs to another user or session' })
   @ApiResponse({ status: 404, description: 'Job not found' })
   async deleteJob(
     @Param('jobId', ParseUUIDPipe) jobId: string,
     @Headers('x-wearme-session-id') sessionId?: string,
+    @Headers('authorization') authorizationHeader?: string,
+    @Headers('x-wearme-auth-token') authTokenHeader?: string,
+    @Headers('cookie') cookieHeader?: string,
   ): Promise<void> {
-    return this.tryOnService.deleteJob(jobId, sessionId);
+    const effectiveSession = this.resolveAndBindSessionCookie(sessionId, cookieHeader);
+    const userId = this.resolveAuthenticatedUserId(
+      authorizationHeader,
+      authTokenHeader,
+      cookieHeader,
+    );
+    return this.tryOnService.deleteJob(jobId, effectiveSession, userId);
   }
 }

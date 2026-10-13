@@ -27,5 +27,22 @@ export class CreateTryOnJobDto {
   @IsOptional()
   @IsString()
   subcategory?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Optional storeId hint; only honored when backed by an active server-side STORE_SPONSORED TryOnSession',
+    example: 'store_indiranagar_01',
+  })
+  @IsOptional()
+  @IsString()
+  storeId?: string;
+
+  @ApiPropertyOptional({
+    description: 'Optional idempotency key to prevent duplicate job creation on client retries',
+    example: 'idem_tryon_001',
+  })
+  @IsOptional()
+  @IsString()
+  idempotencyKey?: string;
 }
 

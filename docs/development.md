@@ -78,13 +78,60 @@ When `ENABLE_NECKLACE_POC=true` is set on **both** `apps/api` and `apps/ai`:
 
 ## Web Application Routes (`apps/web`)
 
+### Public Business & Trust Routes (No Login Required)
 | Route | Purpose |
 |---|---|
-| `/` | Home & Landing Page (4-step pipeline overview, capability tiers, privacy summary, technical FAQ) |
-| `/try-on` | Interactive Virtual Try-On Studio (2-column layout, 8-domain / 38-subcategory selector driven by live API capability status, before/after comparison slider, instant job deletion) |
-| `/categories` | Category Explorer (full 38-item wearable capability matrix with domain & support status filters) |
-| `/history` | Session Results & Job History (syncs and reconciles browser session jobs via `x-wearme-session-id` with `GET /api/v1/try-on/jobs` and supports one-click `DELETE /api/v1/try-on/:jobId`) |
-| `/privacy` | Privacy, Session Scoping (`x-wearme-session-id`), Data Retention (`expiresAt` 7-day metadata, `pnpm cleanup:storage`, immediate hard delete) & Provider Licensing Guide |
+| `/` | Enterprise Business Homepage (Hero, What WearMe Does, 7-step Local Shop + 7-step Online Shopper flows, Audience cards, Security & Privacy section, 12-question FAQ, Contact & Support) |
+| `/about` | About WearMe, Dual-Ecosystem Mission & Engineering Commitments |
+| `/how-it-works` | Detailed 7-step Walk-In Boutique QR flow & 7-step Online Shopper Digital Wardrobe flow |
+| `/partner` | B2B2C Boutique Partner Network, Tiers & Strict Shopkeeper Privacy Boundary Matrix |
+| `/categories` | Category Explorer (full 56-subcategory wearable capability matrix across 8 domains) |
+| `/security` | Security & Privacy Architecture (Customer/Shopkeeper isolation, HMAC-signed files, OTP security, upload validation) |
+| `/privacy` | Data Retention (`expiresAt`), Portrait Deletion, Account Erasure & Provider Licensing Guide |
+| `/terms` | Terms of Use & Visual Style Preview Disclaimers |
+| `/faq` | 12-Question FAQ covering privacy, shopkeeper boundaries, and AI capabilities |
+| `/help` | Help Center & Portrait Upload Guides |
+| `/contact` | Interactive Contact & Support Desk (`POST /api/v1/wardrobe/contact`) |
+| `/login` | Multi-Channel Passwordless OTP Sign-In (`whatsapp`, `sms`, `email`) |
+| `/try-on?storeId=<validStoreId>` | Zero-friction Walk-In Boutique QR Try-On Exception (server-verified store attribution) |
+
+### Protected Customer Application Routes (Requires Authentication)
+| Route | Purpose |
+|---|---|
+| `/try-on` | Standalone Online Virtual Try-On Studio (requires customer authentication when accessed without a valid boutique QR `storeId`) |
+| `/my-wardrobe` | Personal Digital Wardrobe (saved base portrait, 1-click cross-retailer try-on catalog, saved looks, 1-click portrait deletion) |
+| `/history` | Customer Session & Job History (inspect and permanently delete try-on jobs and files) |
+| `/account` | Customer Account & Privacy Controls (`DELETE /api/v1/wardrobe/portrait`, `DELETE /api/v1/wardrobe/account`, `POST /api/v1/auth/logout`) |
+
+## Security, Multi-Channel OTP & Customer/Shopkeeper Isolation (`apps/api`)
+
+```env
+# HMAC secret for signing customer auth tokens, HttpOnly cookies, and signed file URLs
+AUTH_TOKEN_SECRET=replace-with-32-byte-secret-in-production
+
+# Optional live webhook endpoints for OTP delivery (when omitted in non-production, local sandbox preview is used)
+WHATSAPP_OTP_WEBHOOK_URL=
+SMS_OTP_WEBHOOK_URL=
+EMAIL_OTP_WEBHOOK_URL=
+```
+
+- **Strict Shopkeeper Boundary**: `GET /api/v1/files/jobs/:jobId/:filename` and `GET /api/v1/files/users/:userId/:filename` enforce server-side ownership checks and immediately reject any request carrying shopkeeper headers (`x-wearme-partner-store-id`, `x-wearme-partner-key`) or `?storeId=` with `403 Forbidden`. Partner boutiques can only query aggregated counts via `GET /api/v1/wardrobe/stores/:storeId/analytics`, `GET /api/v1/wardrobe/stores/:storeId/subscription`, and `GET /api/v1/wardrobe/stores/:storeId/usage`.
+- **Multi-Channel OTP (`whatsapp`, `sms`, `email`)**: `POST /api/v1/wardrobe/otp/request` and `POST /api/v1/wardrobe/session/upgrade` support WhatsApp, SMS, and Email OTP verification with 5-minute TTL, 30-second resend cooldown, attempt lockouts, constant-time comparison, and single-use invalidation. In `NODE_ENV=production`, the `123456` dev fallback is strictly disabled.
+
+## Store-Sponsored QR Sessions, Subscription Quotas & Consumer Billing (`apps/api`)
+
+```env
+STORE_SESSION_MAX_LIFETIME_MINUTES=60
+STORE_SESSION_INACTIVITY_MINUTES=15
+PERSONAL_AUTHENTICATED_CREDITS=10
+PERSONAL_ANONYMOUS_CREDITS=5
+USAGE_RESERVATION_TTL_MINUTES=15
+```
+
+- **Server-Verified Billing Mode (`STORE_SPONSORED` vs `PERSONAL`)**: Every `TryOnJob` records an authoritative `billingMode` (`STORE_SPONSORED`, `PERSONAL`, or `LEGACY_UNKNOWN`). The backend never infers billing responsibility from `User.originStoreId`, a query parameter (`?storeId=`), or browser storage alone.
+- **Bounded Store-Sponsored QR Sessions**: Scanning `/try-on?storeId=<storeId>` invokes `POST /api/v1/wardrobe/stores/:storeId/sessions`, which creates or inspects a server-side `TryOnSession` with `sponsoredExpiresAt` (`STORE_SESSION_MAX_LIFETIME_MINUTES`, default 60 min) and `inactivityTimeoutMinutes` (default 15 min). Refreshing the page (`forceRefreshScan: false`) never extends `sponsoredExpiresAt`.
+- **Switching to Personal WearMe**: Customers can switch their session to Personal WearMe (`POST /api/v1/entitlements/session/switch-personal`) or inspect their current billing mode and personal/sponsored credits (`GET /api/v1/entitlements/status`) at any time.
+- **Cross-Instance Pre-Inference Atomic Quota Reservation**: Before downloading images or invoking AI inference, `TryOnService.processJob` performs a row-locked conditional PostgreSQL `UPDATE` on `PartnerStoreSubscription` (`STORE_SPONSORED`) or `ConsumerEntitlement` (`PERSONAL`), creates a unique `UsageReservation` (`PENDING`), and appends a `UsageLedgerEntry` (`RESERVATION`). On completion, the reservation transitions idempotently (`PENDING -> CONSUMED`). On failure, the reservation transitions idempotently (`PENDING -> RELEASED`), refunding `reservedCredits` and incrementing `failedGenerationsCount` at most once.
 
 ## Troubleshooting Hugging Face (`AI_PROVIDER=huggingface`)
 

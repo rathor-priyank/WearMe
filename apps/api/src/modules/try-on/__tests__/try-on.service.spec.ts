@@ -663,4 +663,200 @@ describe('TryOnService, LocalStorageProvider & FastApiProvider', () => {
 
     await fs.rm(tmpRoot, { recursive: true, force: true });
   });
+
+  it('atomically reserves quota BEFORE AI inference so two simultaneous requests cannot consume the last credit twice', async () => {
+    const storeId = 'store_indiranagar_01';
+    await service.setQuotaBalance(storeId, 1);
+
+    const jobA = {
+      id: 'aaaa1111-1111-4111-8111-111111111111',
+      status: 'PENDING',
+      category: 'TSHIRT',
+      storeId,
+      personImageKey: 'jobs/aaaa1111-1111-4111-8111-111111111111/person.jpg',
+      garmentImageKey: 'jobs/aaaa1111-1111-4111-8111-111111111111/garment.jpg',
+      personImageMeta: { mimeType: 'image/jpeg' },
+      garmentImageMeta: { mimeType: 'image/jpeg', subcategory: 'TSHIRT', storeId },
+      createdAt: new Date(),
+    };
+    const jobB = {
+      id: 'bbbb2222-2222-4222-8222-222222222222',
+      status: 'PENDING',
+      category: 'TSHIRT',
+      storeId,
+      personImageKey: 'jobs/bbbb2222-2222-4222-8222-222222222222/person.jpg',
+      garmentImageKey: 'jobs/bbbb2222-2222-4222-8222-222222222222/garment.jpg',
+      personImageMeta: { mimeType: 'image/jpeg' },
+      garmentImageMeta: { mimeType: 'image/jpeg', subcategory: 'TSHIRT', storeId },
+      createdAt: new Date(),
+    };
+
+    mockDb.tryOnJob.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
+      if (where.id === jobA.id) return jobA;
+      if (where.id === jobB.id) return jobB;
+      return null;
+    });
+    mockDb.tryOnJob.update.mockImplementation(async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => ({
+      id: where.id,
+      ...data,
+    }));
+
+    // Simulate slow AI inference (50ms) so both requests overlap in time
+    mockAi.processJob.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return {
+        resultImageBuffer: validJpegBuffer,
+        resultMimeType: 'image/jpeg',
+        provider: 'mock',
+        inferenceMs: 50,
+      };
+    });
+
+    // Fire both requests concurrently against the single remaining credit
+    const results = await Promise.allSettled([
+      service.processJob(jobA.id),
+      service.processJob(jobB.id),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter(
+      (r): r is PromiseRejectedResult => r.status === 'rejected',
+    );
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]?.reason?.message).toMatch(/credit quota exhausted/i);
+
+    // Crucial invariant: AI provider was invoked ONLY ONCE, never twice
+    expect(mockAi.processJob).toHaveBeenCalledTimes(1);
+
+    const finalQuota = await service.getQuotaBalance(storeId);
+    expect(finalQuota.creditBalance).toBe(0);
+    expect(finalQuota.totalCreditsUsed).toBe(1);
+  });
+
+  it('refunds the reserved quota credit when AI inference fails and enforces DB conditional updateMany', async () => {
+    const storeId = 'store_koramangala_02';
+    await service.setQuotaBalance(storeId, 1);
+
+    const jobFail = {
+      id: 'cccc3333-3333-4333-8333-333333333333',
+      status: 'PENDING',
+      category: 'SHIRT',
+      storeId,
+      personImageKey: 'jobs/cccc3333-3333-4333-8333-333333333333/person.jpg',
+      garmentImageKey: 'jobs/cccc3333-3333-4333-8333-333333333333/garment.jpg',
+      personImageMeta: { mimeType: 'image/jpeg' },
+      garmentImageMeta: { mimeType: 'image/jpeg', subcategory: 'SHIRT', storeId },
+      createdAt: new Date(),
+    };
+
+    mockDb.tryOnJob.findUnique.mockResolvedValue(jobFail);
+    mockDb.tryOnJob.update.mockResolvedValue({ ...jobFail, status: 'FAILED' });
+    mockAi.processJob.mockRejectedValueOnce(new Error('Upstream GPU timeout'));
+
+    await expect(service.processJob(jobFail.id)).rejects.toThrow(
+      InternalServerErrorException,
+    );
+
+    // Reserved credit must be refunded back to 1 after AI failure
+    const refundedQuota = await service.getQuotaBalance(storeId);
+    expect(refundedQuota.creditBalance).toBe(1);
+    expect(refundedQuota.totalCreditsUsed).toBe(0);
+
+    // Also verify DB-level PartnerStore.updateMany atomic conditional rejection (count: 0)
+    // Simulate two multi-worker instances where local memory has credits, but shared PostgreSQL
+    // PartnerStore row only has 1 credit left (`WHERE storeId = $1 AND creditBalance >= 1`).
+    await service.setQuotaBalance(storeId, 10);
+    let pgStoreRowCredits = 1;
+    (mockDb as Record<string, unknown>)['partnerStore'] = {
+      updateMany: jest.fn().mockImplementation(async () => {
+        if (pgStoreRowCredits >= 1) {
+          pgStoreRowCredits -= 1;
+          return { count: 1 };
+        }
+        return { count: 0 };
+      }),
+      findUnique: jest.fn().mockImplementation(async () => ({
+        creditBalance: pgStoreRowCredits,
+        totalCreditsUsed: 1 - pgStoreRowCredits,
+      })),
+    };
+
+    const pgJob1 = { ...jobFail, id: 'eeee5555-5555-4555-8555-555555555551' };
+    const pgJob2 = { ...jobFail, id: 'eeee5555-5555-4555-8555-555555555552' };
+    mockDb.tryOnJob.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) =>
+      where.id === pgJob1.id ? pgJob1 : pgJob2,
+    );
+    mockDb.tryOnJob.update.mockImplementation(async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => ({
+      id: where.id,
+      ...data,
+    }));
+    mockAi.processJob.mockClear();
+    mockAi.processJob.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return {
+        resultImageBuffer: validJpegBuffer,
+        resultMimeType: 'image/jpeg',
+        provider: 'mock',
+        inferenceMs: 30,
+      };
+    });
+
+    const pgConcurrentResults = await Promise.allSettled([
+      service.processJob(pgJob1.id),
+      service.processJob(pgJob2.id),
+    ]);
+
+    expect(pgConcurrentResults.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(pgConcurrentResults.filter((r) => r.status === 'rejected')).toHaveLength(1);
+    expect(mockAi.processJob).toHaveBeenCalledTimes(1);
+    expect(pgStoreRowCredits).toBe(0);
+  });
+
+  it('prevents duplicate AI inference when two concurrent requests call processJob on the same PENDING jobId', async () => {
+    const storeId = 'store_jayanagar_03';
+    await service.setQuotaBalance(storeId, 5);
+
+    const sameJob = {
+      id: 'dddd4444-4444-4444-8444-444444444444',
+      status: 'PENDING',
+      category: 'TSHIRT',
+      storeId,
+      personImageKey: 'jobs/dddd4444-4444-4444-8444-444444444444/person.jpg',
+      garmentImageKey: 'jobs/dddd4444-4444-4444-8444-444444444444/garment.jpg',
+      personImageMeta: { mimeType: 'image/jpeg' },
+      garmentImageMeta: { mimeType: 'image/jpeg', subcategory: 'TSHIRT', storeId },
+      createdAt: new Date(),
+    };
+
+    mockDb.tryOnJob.findUnique.mockResolvedValue(sameJob);
+    mockDb.tryOnJob.update.mockResolvedValue({
+      ...sameJob,
+      status: 'COMPLETED',
+      resultImageKey: 'jobs/dddd4444-4444-4444-8444-444444444444/result.jpg',
+    });
+
+    mockAi.processJob.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return {
+        resultImageBuffer: validJpegBuffer,
+        resultMimeType: 'image/jpeg',
+        provider: 'mock',
+        inferenceMs: 40,
+      };
+    });
+
+    const [res1, res2] = await Promise.all([
+      service.processJob(sameJob.id),
+      service.processJob(sameJob.id),
+    ]);
+
+    expect([res1.status, res2.status]).toContain(TryOnStatus.COMPLETED);
+    expect(mockAi.processJob).toHaveBeenCalledTimes(1);
+
+    const quotaAfter = await service.getQuotaBalance(storeId);
+    expect(quotaAfter.creditBalance).toBe(4);
+    expect(quotaAfter.totalCreditsUsed).toBe(1);
+  });
 });

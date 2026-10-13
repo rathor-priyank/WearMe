@@ -27,8 +27,8 @@ import { ImageUpload } from '@/components/image-upload';
 import { TryOnResult } from '@/components/try-on-result';
 import { tryOnApi, buildFallbackCategoriesResponse } from '@/lib/api-client';
 import {
+  clearStoredStoreContext,
   getOrCreateSessionId,
-  getStoredStoreContext,
   recordSessionJob,
   removeSessionJob,
   setStoredStoreContext,
@@ -44,6 +44,8 @@ import type {
   JobStatusResponse,
   CategoriesResponse,
   CategoryCapabilityItem,
+  EntitlementStatusResponse,
+  SponsoredSessionStateResponse,
 } from '@wearme/shared';
 import { cn } from '@/lib/utils';
 
@@ -119,10 +121,11 @@ function TryOnStudioContent() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [personPreview, setPersonPreview] = useState<string | null>(null);
   const [productPreview, setProductPreview] = useState<string | null>(null);
-  const [storeContext, setStoreContext] = useState<StoreQrContext>({
-    storeId: 'store_indiranagar_01',
-    storeName: 'Studio Namma Indiranagar',
-  });
+  const [storeContext, setStoreContext] = useState<StoreQrContext | null>(null);
+  const [sponsoredSession, setSponsoredSession] =
+    useState<SponsoredSessionStateResponse | null>(null);
+  const [entitlements, setEntitlements] = useState<EntitlementStatusResponse | null>(null);
+  const [isSwitchingMode, setIsSwitchingMode] = useState(false);
   const [activeSessionToken, setActiveSessionToken] = useState<string>('');
 
   // Load capability catalog from API with immediate fallback
@@ -139,36 +142,91 @@ function TryOnStudioContent() {
     return buildFallbackCategoriesResponse().categories;
   }, [categoriesData]);
 
-  // Pre-select subcategory & store QR context from URL query parameters if present
+  const refreshEntitlements = useCallback(async () => {
+    try {
+      const status = await tryOnApi.getEntitlements();
+      setEntitlements(status);
+      if (status.sponsoredSession) {
+        setSponsoredSession(status.sponsoredSession);
+      }
+    } catch {
+      // Non-fatal if API is offline in preview
+    }
+  }, []);
+
+  // Pre-select subcategory & establish/inspect bounded Store-Sponsored QR Session vs. Personal WearMe mode
   useEffect(() => {
     setActiveSessionToken(getOrCreateSessionId());
-    const storedCtx = getStoredStoreContext();
-    const paramStoreId = searchParams.get('storeId');
-    const paramStoreName = searchParams.get('storeName');
+    const paramStoreId = searchParams.get('storeId')?.trim();
+    const paramQrToken = searchParams.get('qrToken')?.trim();
+    let cancelled = false;
+
     if (paramStoreId) {
-      const nextCtx: StoreQrContext = {
-        storeId: paramStoreId,
-        storeName: paramStoreName || 'Studio Namma Indiranagar',
-      };
-      setStoreContext(nextCtx);
-      setStoredStoreContext(nextCtx);
-    } else if (storedCtx) {
-      setStoreContext(storedCtx);
+      tryOnApi
+        .startOrInspectSponsoredSession(paramStoreId, paramQrToken)
+        .then((sessionState) => {
+          if (cancelled) return;
+          setSponsoredSession(sessionState);
+          if (sessionState.active && sessionState.storeId && sessionState.storeName) {
+            const verifiedCtx: StoreQrContext = {
+              storeId: sessionState.storeId,
+              storeName: sessionState.storeName,
+              expiresAt: sessionState.expiresAt,
+            };
+            setStoreContext(verifiedCtx);
+            setStoredStoreContext(verifiedCtx);
+          } else {
+            setStoreContext(null);
+            clearStoredStoreContext();
+          }
+          void refreshEntitlements();
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setSponsoredSession(null);
+          setStoreContext(null);
+          clearStoredStoreContext();
+          void refreshEntitlements();
+        });
     } else {
-      setStoredStoreContext({
-        storeId: 'store_indiranagar_01',
-        storeName: 'Studio Namma Indiranagar',
-      });
+      // No ?storeId= in URL -> never default to a store; inspect server entitlement state
+      clearStoredStoreContext();
+      setStoreContext(null);
+      setSponsoredSession(null);
+      void refreshEntitlements();
     }
 
     const paramSub = searchParams.get('subcategory')?.toUpperCase();
-    if (!paramSub) return;
-    const matched = catalogItems.find((item) => item.subcategory === paramSub);
-    if (matched) {
-      setSelectedDomain(matched.domain);
-      setSelectedSubcategory(matched.subcategory);
+    if (paramSub) {
+      const matched = catalogItems.find((item) => item.subcategory === paramSub);
+      if (matched) {
+        setSelectedDomain(matched.domain);
+        setSelectedSubcategory(matched.subcategory);
+      }
     }
-  }, [searchParams, catalogItems]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [searchParams, catalogItems, refreshEntitlements]);
+
+  const handleSwitchToPersonalMode = useCallback(async () => {
+    setIsSwitchingMode(true);
+    setSubmitError(null);
+    try {
+      const updated = await tryOnApi.switchToPersonalMode();
+      setEntitlements(updated);
+      setSponsoredSession(null);
+      setStoreContext(null);
+      clearStoredStoreContext();
+    } catch (err: unknown) {
+      setSubmitError(
+        err instanceof Error ? err.message : 'Could not switch to Personal WearMe mode.',
+      );
+    } finally {
+      setIsSwitchingMode(false);
+    }
+  }, []);
 
   const handleLoadWalkInDemoInputs = useCallback(async () => {
     const createCanvasFile = async (
@@ -285,6 +343,13 @@ function TryOnStudioContent() {
 
   const handleSubmit = useCallback(async () => {
     if (isSubmitting) return;
+    if (sponsoredSession && !sponsoredSession.active) {
+      setSubmitError(
+        sponsoredSession.message ||
+          'Your in-store try-on session has ended. Click "Continue with Personal WearMe" or "Scan Shop QR Again" above.',
+      );
+      return;
+    }
     if (!isStudioUploadable) {
       setSubmitError(
         `${activeSpec.label} requires a specialized model (${activeSpec.routingStrategy}) and cannot be processed through the upper-body clothing or necklace PoC pipeline.`,
@@ -303,12 +368,18 @@ function TryOnStudioContent() {
 
     let createdJobId: string | null = null;
     try {
-      // Step 1: Upload images and create job (pass dbCategory + explicit subcategory)
+      const sponsoredStoreIdToPass =
+        sponsoredSession?.active && sponsoredSession.storeId
+          ? sponsoredSession.storeId
+          : undefined;
+
+      // Step 1: Upload images and create job (pass dbCategory + explicit subcategory + verified storeId only if active)
       const job = await tryOnApi.upload(
         personImage,
         garmentImage,
         activeSpec.dbCategory,
         activeSpec.subcategory,
+        sponsoredStoreIdToPass,
       );
       createdJobId = job.jobId;
 
@@ -332,11 +403,13 @@ function TryOnStudioContent() {
       // Step 2: Trigger AI inference while user sees the processing indicator
       await tryOnApi.process(job.jobId);
       await queryClient.invalidateQueries({ queryKey: ['job', job.jobId] });
+      void refreshEntitlements();
       setIsSubmitting(false);
       setStep('result');
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Request failed. Please try again.';
       setIsSubmitting(false);
+      void refreshEntitlements();
 
       if (createdJobId) {
         setProcessError(message);
@@ -348,6 +421,7 @@ function TryOnStudioContent() {
     }
   }, [
     isSubmitting,
+    sponsoredSession,
     isStudioUploadable,
     activeSpec,
     personImage,
@@ -355,7 +429,15 @@ function TryOnStudioContent() {
     personPreview,
     productPreview,
     queryClient,
+    refreshEntitlements,
   ]);
+
+  const handleEditInputs = useCallback(() => {
+    setStep('upload');
+    setJobId(null);
+    setSubmitError(null);
+    setProcessError(null);
+  }, []);
 
   const handleReset = useCallback(() => {
     setStep('upload');
@@ -386,7 +468,11 @@ function TryOnStudioContent() {
   );
 
   const canSubmit =
-    !!personImage && !!garmentImage && !isSubmitting && isStudioUploadable;
+    !!personImage &&
+    !!garmentImage &&
+    !isSubmitting &&
+    isStudioUploadable &&
+    !(sponsoredSession && !sponsoredSession.active);
 
   const fallbackJob: JobStatusResponse = processError
     ? {
@@ -407,14 +493,24 @@ function TryOnStudioContent() {
 
   const activeBadge = getSupportBadge(activeSpec);
 
+  const steps = [
+    { id: 'upload', label: '1. Select & Upload' },
+    { id: 'processing', label: '2. AI Processing' },
+    { id: 'result', label: '3. Review & Save Look' },
+  ] as const;
+
   return (
     <div className="mx-auto max-w-6xl px-4 py-8 sm:px-6 md:py-10">
-      {/* Studio Header Bar */}
-      <div className="mb-8 flex flex-col justify-between gap-4 border-b border-neutral-800/80 pb-6 sm:flex-row sm:items-center">
+      {/* Studio Header & 3-Step Flow Indicator */}
+      <div className="mb-8 flex flex-col justify-between gap-4 border-b border-neutral-800/80 pb-6 md:flex-row md:items-center">
         <div>
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-violet-400">
             <Sparkles className="h-3.5 w-3.5" />
-            Interactive Virtual Try-On Studio
+            <span>
+              {sponsoredSession?.active && storeContext
+                ? `In-Store Try-On · ${storeContext.storeName}`
+                : 'Virtual Try-On Studio'}
+            </span>
           </div>
           <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">
             Configure &amp; Run Try-On
@@ -425,65 +521,167 @@ function TryOnStudioContent() {
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2.5">
-          <Link
-            href="/my-wardrobe"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-800/70 bg-emerald-950/40 px-3.5 py-2 text-xs font-medium text-emerald-300 hover:border-emerald-700 hover:text-white transition-colors"
-          >
-            <BookmarkCheck className="h-3.5 w-3.5 text-emerald-400" />
-            My Wardrobe
-          </Link>
-          <Link
-            href="/categories"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-800 bg-neutral-900 px-3.5 py-2 text-xs font-medium text-neutral-300 hover:border-neutral-700 hover:text-white transition-colors"
-          >
-            <Layers className="h-3.5 w-3.5 text-violet-400" />
-            Capability Matrix
-          </Link>
-          <Link
-            href="/history"
-            className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-800 bg-neutral-900 px-3.5 py-2 text-xs font-medium text-neutral-300 hover:border-neutral-700 hover:text-white transition-colors"
-          >
-            <History className="h-3.5 w-3.5 text-violet-400" />
-            Session History
-          </Link>
-        </div>
+        <ol
+          data-testid="tryon-step-indicator"
+          aria-label="Try-on progress"
+          className="flex flex-wrap items-center gap-2"
+        >
+          {steps.map((s) => {
+            const isCurrent = step === s.id;
+            return (
+              <li
+                key={s.id}
+                aria-current={isCurrent ? 'step' : undefined}
+                className={cn(
+                  'rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors',
+                  isCurrent
+                    ? 'border-violet-600 bg-violet-950/70 text-violet-200'
+                    : 'border-neutral-800 bg-neutral-900/60 text-neutral-400',
+                )}
+              >
+                {s.label}
+              </li>
+            );
+          })}
+        </ol>
       </div>
 
-      {/* B2B2C Walk-In Store QR Session Context Banner */}
-      <div className="mb-6 flex flex-col justify-between gap-3 rounded-2xl border border-violet-800/50 bg-gradient-to-r from-violet-950/35 via-neutral-900/90 to-emerald-950/30 px-4 py-3.5 sm:flex-row sm:items-center">
-        <div className="flex items-start gap-3">
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-violet-700/60 bg-violet-950/70 text-violet-300">
-            <QrCode className="h-4 w-4" />
-          </div>
-          <div>
-            <div className="flex flex-wrap items-center gap-2 text-xs">
-              <span className="inline-flex items-center gap-1 font-semibold text-violet-200">
-                <Store className="h-3.5 w-3.5 text-emerald-400" />
-                Walk-In Store QR Pass: {storeContext.storeName}
-              </span>
-              {activeSessionToken && (
-                <span className="rounded bg-neutral-950/90 px-2 py-0.5 font-mono text-[11px] text-neutral-400">
-                  x-wearme-session-id: {activeSessionToken.slice(0, 16)}…
-                </span>
-              )}
+      {/* Billing & Session Entitlement Mode Banner */}
+      {sponsoredSession && !sponsoredSession.active ? (
+        <div
+          data-testid="expired-store-session-banner"
+          className="mb-6 flex flex-col justify-between gap-4 rounded-2xl border border-amber-700/70 bg-amber-950/35 px-5 py-4 sm:flex-row sm:items-center"
+        >
+          <div className="flex items-start gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-amber-700/60 bg-amber-950/80 text-amber-300">
+              <Clock className="h-5 w-5" />
             </div>
-            <p className="mt-0.5 text-xs text-neutral-400">
-              Complete a try-on below, then click <strong className="text-emerald-300">Save to Wardrobe (WhatsApp OTP)</strong> to upgrade this anonymous store session into your persistent B2C Digital Wardrobe.
-            </p>
+            <div>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-semibold text-amber-200">
+                  In-Store Try-On Session Ended ({sponsoredSession.expiredReason ?? 'EXPIRED'})
+                </span>
+                {sponsoredSession.storeName && (
+                  <span className="rounded bg-neutral-950/80 px-2 py-0.5 text-[11px] text-neutral-300">
+                    {sponsoredSession.storeName}
+                  </span>
+                )}
+              </div>
+              <p className="mt-1 text-xs leading-relaxed text-amber-100/90">
+                {sponsoredSession.message}
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2.5">
+            <button
+              type="button"
+              disabled={isSwitchingMode}
+              onClick={handleSwitchToPersonalMode}
+              className="rounded-xl bg-violet-600 px-4 py-2 text-xs font-semibold text-white hover:bg-violet-500 disabled:opacity-50 transition-colors"
+            >
+              Continue with Personal WearMe
+            </button>
+            <span className="rounded-xl border border-amber-700/50 bg-amber-950/50 px-3 py-2 text-[11px] text-amber-200/90">
+              Or scan the physical QR standee in store to check in again
+            </span>
           </div>
         </div>
-        {step === 'upload' && (
-          <button
-            type="button"
-            data-testid="load-walkin-demo-button"
-            onClick={handleLoadWalkInDemoInputs}
-            className="shrink-0 rounded-xl border border-violet-700/60 bg-violet-950/60 px-3.5 py-2 text-xs font-semibold text-violet-200 hover:bg-violet-900/60 hover:text-white transition-colors"
-          >
-            Load Sample Walk-In QR Inputs
-          </button>
-        )}
-      </div>
+      ) : sponsoredSession?.active && storeContext ? (
+        <div
+          data-testid="active-store-session-banner"
+          className="mb-6 flex flex-col justify-between gap-3 rounded-2xl border border-violet-800/50 bg-gradient-to-r from-violet-950/35 via-neutral-900/90 to-emerald-950/30 px-4 py-3.5 sm:flex-row sm:items-center"
+        >
+          <div className="flex items-start gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-violet-700/60 bg-violet-950/70 text-violet-300">
+              <QrCode className="h-4 w-4" />
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="inline-flex items-center gap-1 font-semibold text-violet-200">
+                  <Store className="h-3.5 w-3.5 text-emerald-400" />
+                  Trying on at {storeContext.storeName} (Store-Sponsored Session)
+                </span>
+                <span className="rounded bg-emerald-950/80 border border-emerald-800/60 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
+                  {Math.max(1, Math.ceil((sponsoredSession.remainingSeconds ?? 3600) / 60))} min left
+                </span>
+                {typeof sponsoredSession.storeQuotaRemaining === 'number' && (
+                  <span className="rounded bg-neutral-950/90 px-2 py-0.5 font-mono text-[11px] text-neutral-400">
+                    Store quota remaining: {sponsoredSession.storeQuotaRemaining}
+                  </span>
+                )}
+              </div>
+              <p className="mt-0.5 text-xs text-neutral-400">
+                Sponsored by {storeContext.storeName} while you are in store. Save your look with OTP after generation to keep it in your personal Digital Wardrobe.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {step === 'upload' && (
+              <button
+                type="button"
+                data-testid="load-walkin-demo-button"
+                onClick={handleLoadWalkInDemoInputs}
+                className="shrink-0 rounded-xl border border-violet-700/60 bg-violet-950/60 px-3.5 py-2 text-xs font-semibold text-violet-200 hover:bg-violet-900/60 hover:text-white transition-colors"
+              >
+                Load Sample Walk-In QR Inputs
+              </button>
+            )}
+            <button
+              type="button"
+              disabled={isSwitchingMode}
+              onClick={handleSwitchToPersonalMode}
+              className="shrink-0 rounded-xl border border-neutral-700 bg-neutral-900 px-3 py-2 text-xs font-medium text-neutral-300 hover:border-neutral-600 hover:text-white transition-colors"
+            >
+              Switch to Personal Mode
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div
+          data-testid="personal-wearme-banner"
+          className="mb-6 flex flex-col justify-between gap-3 rounded-2xl border border-neutral-800 bg-neutral-900/70 px-4 py-3.5 sm:flex-row sm:items-center"
+        >
+          <div className="flex items-start gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-emerald-800/60 bg-emerald-950/50 text-emerald-300">
+              <Sparkles className="h-4 w-4" />
+            </div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-semibold text-neutral-100">
+                  Personal WearMe Mode
+                </span>
+                {entitlements?.personalEntitlement && (
+                  <span className="rounded border border-emerald-800/60 bg-emerald-950/50 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
+                    Personal Allowance: {entitlements.personalEntitlement.remainingCredits} /{' '}
+                    {entitlements.personalEntitlement.includedCredits} credits remaining
+                  </span>
+                )}
+                {activeSessionToken && (
+                  <span className="rounded bg-neutral-950/90 px-2 py-0.5 font-mono text-[11px] text-neutral-500">
+                    Session: {activeSessionToken.slice(0, 14)}…
+                  </span>
+                )}
+              </div>
+              <p className="mt-0.5 text-xs text-neutral-400">
+                Try-ons here use your Personal WearMe allowance and never charge any partner boutique.
+                {entitlements?.originStoreAttribution?.storeName
+                  ? ` (Originally joined via ${entitlements.originStoreAttribution.storeName} — first-touch attribution only.)`
+                  : ''}
+              </p>
+            </div>
+          </div>
+          {step === 'upload' && (
+            <button
+              type="button"
+              data-testid="load-walkin-demo-button"
+              onClick={handleLoadWalkInDemoInputs}
+              className="shrink-0 rounded-xl border border-neutral-700 bg-neutral-950 px-3.5 py-2 text-xs font-semibold text-neutral-200 hover:border-violet-700/60 hover:text-white transition-colors"
+            >
+              Load Sample Studio Inputs
+            </button>
+          )}
+        </div>
+      )}
 
       {deletedNotice && (
         <div className="mb-6 flex items-center gap-2.5 rounded-xl border border-emerald-800/80 bg-emerald-950/30 px-4 py-3 text-sm text-emerald-300">
@@ -761,7 +959,7 @@ function TryOnStudioContent() {
                   <dt className="text-neutral-400">Routing Strategy</dt>
                   <dd className="font-mono text-violet-300">{activeSpec.routingStrategy}</dd>
                 </div>
-                <div>
+                  <div>
                   <dt className="mb-1.5 text-neutral-400">Required Anatomical Landmarks</dt>
                   <dd className="flex flex-wrap gap-1.5">
                     {activeSpec.requiredLandmarks.map((lm) => (
@@ -775,6 +973,16 @@ function TryOnStudioContent() {
                   </dd>
                 </div>
               </dl>
+
+              <div className="mt-4 border-t border-neutral-800/80 pt-3">
+                <Link
+                  href="/categories"
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-violet-300 hover:text-violet-200"
+                >
+                  <Layers className="h-3.5 w-3.5" />
+                  <span>Inspect all 38 wearable subcategories &amp; routing status</span>
+                </Link>
+              </div>
             </div>
 
             {/* Best Results Checklist */}
@@ -863,6 +1071,7 @@ function TryOnStudioContent() {
             personPreview={personPreview}
             productPreview={productPreview}
             onReset={handleReset}
+            onEditInputs={handleEditInputs}
             onDelete={handleDeleteJob}
           />
         </div>

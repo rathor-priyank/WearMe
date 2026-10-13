@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { SiteHeader } from '@/components/site-header';
 import { SiteFooter } from '@/components/site-footer';
+import { ContextualNavBar } from '@/components/contextual-nav';
 import { tryOnApi } from '@/lib/api-client';
 import {
   clearStoredAuthSession,
@@ -53,6 +54,7 @@ export default function MyWardrobePage() {
   const [tryingCatalogId, setTryingCatalogId] = useState<string | null>(null);
   const [tryOnError, setTryOnError] = useState<string | null>(null);
   const [tryOnSuccessNotice, setTryOnSuccessNotice] = useState<string | null>(null);
+  const [deletingPortrait, setDeletingPortrait] = useState(false);
 
   const loadWardrobe = useCallback(async () => {
     setLoading(true);
@@ -150,7 +152,27 @@ export default function MyWardrobePage() {
     }
   };
 
-  const handleSignOut = () => {
+  const handleDeletePortrait = async () => {
+    if (deletingPortrait) return;
+    setDeletingPortrait(true);
+    setTryOnError(null);
+    try {
+      await tryOnApi.deletePortrait();
+      await loadWardrobe();
+      setTryOnSuccessNotice('Your saved base portrait has been permanently deleted from storage.');
+    } catch (err: unknown) {
+      setTryOnError(err instanceof Error ? err.message : 'Failed to delete saved portrait.');
+    } finally {
+      setDeletingPortrait(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await tryOnApi.logout();
+    } catch {
+      // Proceed with local sign-out even if network call fails
+    }
     clearStoredAuthSession();
     setWardrobe(null);
     setUnauthenticated(true);
@@ -162,39 +184,38 @@ export default function MyWardrobePage() {
       <SiteHeader />
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6 md:py-10">
+        <ContextualNavBar
+          backHref="/try-on"
+          backLabel="Back to Try-On"
+          breadcrumbs={[
+            { label: 'Try On', href: '/try-on' },
+            { label: 'My Wardrobe' },
+          ]}
+        />
+
         {/* Page Header */}
         <div className="mb-8 flex flex-col justify-between gap-4 border-b border-neutral-800/80 pb-6 sm:flex-row sm:items-center">
           <div>
             <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-emerald-400">
               <BookmarkCheck className="h-3.5 w-3.5" />
-              B2C Persistent Digital Wardrobe · Network Effect Flywheel
+              Personal Digital Wardrobe
             </div>
             <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">
               My Digital Wardrobe
             </h1>
             <p className="mt-1 text-sm text-neutral-400">
-              Your saved walk-in store base portrait and cross-platform online retailer try-on hub.
+              Your private saved portrait and cross-platform online retailer try-on hub.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
             <Link
-              href="/try-on?storeId=store_indiranagar_01&storeName=Studio%20Namma%20Indiranagar"
-              className="inline-flex items-center gap-1.5 rounded-lg bg-violet-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-violet-500 transition-colors"
+              href="/try-on"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-violet-600 px-4 py-2 text-xs font-semibold text-white hover:bg-violet-500 transition-colors"
             >
               <Wand2 className="h-3.5 w-3.5" />
-              Walk-In Studio QR Try-On
+              Start Custom Try-On
             </Link>
-            {wardrobe && (
-              <button
-                type="button"
-                onClick={handleSignOut}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-neutral-800 bg-neutral-900 px-3.5 py-2 text-xs font-medium text-neutral-300 hover:border-neutral-700 hover:text-white"
-              >
-                <LogOut className="h-3.5 w-3.5 text-neutral-400" />
-                Sign Out
-              </button>
-            )}
           </div>
         </div>
 
@@ -206,7 +227,7 @@ export default function MyWardrobePage() {
             </p>
           </div>
         ) : unauthenticated || !wardrobe ? (
-          /* Protected Route Gate: WhatsApp OTP Session Upgrade */
+          /* Protected Route Gate: OTP Session Upgrade */
           <div
             data-testid="wardrobe-auth-gate"
             className="mx-auto max-w-xl rounded-2xl border border-neutral-800 bg-neutral-900/70 p-6 sm:p-8"
@@ -221,15 +242,15 @@ export default function MyWardrobePage() {
                 </h2>
                 <p className="text-xs text-neutral-400">
                   Upgrade your anonymous walk-in session{' '}
-                  {sessionId ? `(${sessionId.slice(0, 14)}…)` : ''} via WhatsApp OTP
+                  {sessionId ? `(${sessionId.slice(0, 14)}…)` : ''} via OTP
                 </p>
               </div>
             </div>
 
             <p className="mt-4 text-sm leading-relaxed text-neutral-300">
-              When you try on an outfit at a partner boutique via QR code, verifying your WhatsApp
-              number promotes your anonymous <code className="text-violet-300">TryOnSession</code>{' '}
-              into a persistent B2C account—saving your base photo so you can try on garments from
+              When you try on an outfit at a partner boutique via QR code, verifying your account
+              promotes your anonymous <code className="text-violet-300">TryOnSession</code> into a
+              persistent B2C account—saving your base photo privately so you can try on garments from
               cross-platform retailers in 1 click.
             </p>
 
@@ -240,7 +261,7 @@ export default function MyWardrobePage() {
                     htmlFor="gate-phone-input"
                     className="mb-1.5 block text-xs font-medium text-neutral-300"
                   >
-                    WhatsApp Phone Number
+                    WhatsApp / Mobile Number
                   </label>
                   <input
                     id="gate-phone-input"
@@ -264,8 +285,16 @@ export default function MyWardrobePage() {
                   ) : (
                     <Smartphone className="h-4 w-4" />
                   )}
-                  Send WhatsApp OTP &amp; Claim Session
+                  Send OTP &amp; Claim Session
                 </button>
+                <div className="text-center">
+                  <Link
+                    href="/login?returnUrl=/my-wardrobe"
+                    className="text-xs font-medium text-violet-400 hover:text-violet-300 underline"
+                  >
+                    Or sign in with SMS / Email OTP on the Login page
+                  </Link>
+                </div>
               </div>
             ) : (
               <div className="mt-6 space-y-4">
@@ -273,7 +302,7 @@ export default function MyWardrobePage() {
                   <div className="flex items-center justify-between rounded-xl border border-amber-700/60 bg-amber-950/30 px-3.5 py-2.5 text-xs text-amber-200">
                     <span className="inline-flex items-center gap-1.5">
                       <KeyRound className="h-3.5 w-3.5 text-amber-400" />
-                      Dev Sandbox WhatsApp OTP:{' '}
+                      Dev Sandbox OTP:{' '}
                       <code className="font-mono font-bold text-amber-100">{devOtpHint}</code>
                     </span>
                     <button
@@ -291,7 +320,7 @@ export default function MyWardrobePage() {
                     htmlFor="gate-otp-input"
                     className="mb-1.5 block text-xs font-medium text-neutral-300"
                   >
-                    6-Digit WhatsApp OTP
+                    6-Digit OTP
                   </label>
                   <input
                     id="gate-otp-input"
@@ -347,7 +376,7 @@ export default function MyWardrobePage() {
               <div className="flex flex-wrap items-center gap-3">
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-700/60 bg-emerald-950/80 px-3 py-1 text-xs font-semibold text-emerald-300">
                   <UserCheck className="h-3.5 w-3.5" />
-                  Verified WhatsApp: {wardrobe.user.phoneE164}
+                  Verified Identity: {wardrobe.user.phoneE164 || wardrobe.user.email || 'Authenticated'}
                 </span>
                 {wardrobe.user.originStoreName && (
                   <span className="inline-flex items-center gap-1.5 rounded-full border border-violet-700/60 bg-violet-950/60 px-3 py-1 text-xs font-medium text-violet-200">
@@ -357,7 +386,7 @@ export default function MyWardrobePage() {
                 )}
                 <span className="text-xs text-neutral-400">
                   {wardrobe.savedLooks.length} saved look
-                  {wardrobe.savedLooks.length === 1 ? '' : 's'} · Eternal retention (no 7-day expiry)
+                  {wardrobe.savedLooks.length === 1 ? '' : 's'} · Private customer-owned storage
                 </span>
               </div>
             </div>
@@ -389,14 +418,14 @@ export default function MyWardrobePage() {
                       Saved Base Photo
                     </span>
                     <span className="rounded-full border border-emerald-800/60 bg-emerald-950/50 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
-                      1-Click Ready
+                      Private &amp; Isolated
                     </span>
                   </div>
                   <h2 className="mt-1 text-base font-bold text-white">
-                    Your Walk-In Base Portrait
+                    Your Personal Base Portrait
                   </h2>
                   <p className="mt-1 text-xs text-neutral-400">
-                    Promoted from your in-store QR session. Select any partner retailer garment on
+                    Stored in your isolated customer directory. Select any partner retailer garment on
                     the right to try it on immediately without re-uploading a selfie.
                   </p>
 
@@ -422,13 +451,26 @@ export default function MyWardrobePage() {
                   </div>
                 </div>
 
-                <Link
-                  href="/try-on"
-                  className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-neutral-700 bg-neutral-950 py-2.5 text-xs font-semibold text-neutral-200 hover:border-violet-600 hover:text-white"
-                >
-                  <Wand2 className="h-3.5 w-3.5 text-violet-400" />
-                  Update Base Photo in Studio
-                </Link>
+                <div className="mt-4 space-y-2">
+                  <Link
+                    href="/try-on"
+                    className="flex w-full items-center justify-center gap-2 rounded-xl border border-neutral-700 bg-neutral-950 py-2.5 text-xs font-semibold text-neutral-200 hover:border-violet-600 hover:text-white"
+                  >
+                    <Wand2 className="h-3.5 w-3.5 text-violet-400" />
+                    Update Base Photo in Studio
+                  </Link>
+                  {wardrobe.user.basePersonImageUrl && (
+                    <button
+                      type="button"
+                      data-testid="delete-saved-portrait-button"
+                      onClick={handleDeletePortrait}
+                      disabled={deletingPortrait}
+                      className="flex w-full items-center justify-center gap-2 rounded-xl border border-red-900/60 bg-red-950/20 py-2 text-xs font-medium text-red-300 hover:bg-red-950/40 disabled:opacity-60"
+                    >
+                      {deletingPortrait ? 'Deleting Portrait…' : 'Delete Saved Portrait'}
+                    </button>
+                  )}
+                </div>
               </div>
 
               {/* Cross-Platform Retailer Feed */}

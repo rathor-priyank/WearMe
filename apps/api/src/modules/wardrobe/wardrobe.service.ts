@@ -1,20 +1,31 @@
 import {
   Injectable,
   Logger,
+  Optional,
   BadRequestException,
   UnauthorizedException,
+  ForbiddenException,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import axios from 'axios';
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import sharp from 'sharp';
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4, validate as isUuid } from 'uuid';
 import {
   ClothingCategory,
   WearableDomain,
   WearableSubcategory,
+  type AuthChannelsResponse,
+  type ContactInquiryResponse,
+  type DeleteAccountResponse,
+  type DeletePortraitResponse,
+  type OtpChannel,
+  type PartnerStoreAnalyticsResponse,
+  type PartnerStorePublicInfo,
   type RequestOtpResponse,
   type RetailerCatalogItem,
   type UpgradeSessionResponse,
@@ -24,23 +35,38 @@ import {
 import type { Prisma, TryOnJob, User } from '@wearme/database';
 import { DatabaseService } from '../database/database.service';
 import { StorageProvider } from '../storage/storage.provider';
+import {
+  extractAuthTokenFromCookieHeader,
+  resolveSigningSecret,
+} from '../storage/file-token.util';
 import { TryOnService } from '../try-on/try-on.service';
 import type { JobStatusResponseDto } from '../try-on/dto/job-status.dto';
 import type {
+  ContactInquiryDto,
   RequestOtpDto,
   UpgradeSessionDto,
   WardrobeCatalogTryOnDto,
 } from './dto/wardrobe.dto';
+import {
+  createDefaultOtpProviders,
+  getAuthChannelCapabilities,
+  resolveTrustedStoreInfo,
+  type OtpDeliveryProvider,
+} from './otp-providers';
+import { UsageEntitlementService } from './usage-entitlement.service';
 
 const SAFE_SESSION_ID_REGEX = /^[a-zA-Z0-9_-]{8,128}$/;
+const SAFE_EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const OTP_RESEND_COOLDOWN_MS = 30 * 1000; // 30 seconds
 const MAX_OTP_ATTEMPTS = 5;
 const AUTH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const DEV_DEFAULT_OTP = '123456';
 
-interface SignedAuthTokenPayload {
+export interface SignedAuthTokenPayload {
   sub: string;
-  phoneE164: string;
+  phoneE164?: string | null;
+  email?: string | null;
   sessionToken: string;
   iat: number;
   exp: number;
@@ -56,7 +82,7 @@ export const CROSS_RETAILER_CATALOG: RetailerCatalogItem[] = [
     domain: WearableDomain.CLOTHING,
     priceInr: 2990,
     accentColor: '#2563eb',
-    tagline: 'Tailored cotton weave · Cross-platform B2C partner',
+    tagline: 'Sample catalog preview · Cross-retailer B2C demo',
     previewSvgDataUri:
       'data:image/svg+xml;utf8,' +
       encodeURIComponent(
@@ -137,30 +163,49 @@ export const CROSS_RETAILER_CATALOG: RetailerCatalogItem[] = [
 @Injectable()
 export class WardrobeService {
   private readonly logger = new Logger(WardrobeService.name);
+  private otpProviders: Record<OtpChannel, OtpDeliveryProvider>;
 
   constructor(
     private readonly db: DatabaseService,
     private readonly storage: StorageProvider,
     private readonly tryOnService: TryOnService,
     private readonly configService: ConfigService,
-  ) {}
+    @Optional() private readonly usageEntitlementService?: UsageEntitlementService,
+  ) {
+    this.otpProviders = createDefaultOtpProviders();
+  }
+
+  setOtpProvidersForTest(providers: Partial<Record<OtpChannel, OtpDeliveryProvider>>): void {
+    this.otpProviders = {
+      ...this.otpProviders,
+      ...providers,
+    };
+  }
 
   // ─── Helpers & Step-by-Step Execution Trace Logger ───────────────────────
 
-  private getSigningSecret(): string {
+  private getNodeEnv(): string {
     return (
-      this.configService.get<string>('AUTH_TOKEN_SECRET') ??
-      process.env['AUTH_TOKEN_SECRET'] ??
-      'wearme-flywheel-local-hmac-secret-v1'
+      this.configService.get<string>('app.nodeEnv') ??
+      process.env['NODE_ENV'] ??
+      'development'
     );
   }
 
+  private getSigningSecret(): string {
+    const configured =
+      this.configService.get<string>('AUTH_TOKEN_SECRET') ??
+      process.env['AUTH_TOKEN_SECRET'];
+    if (this.getNodeEnv() === 'production' && !configured) {
+      throw new ServiceUnavailableException(
+        'AUTH_TOKEN_SECRET must be configured in production.',
+      );
+    }
+    return resolveSigningSecret(configured);
+  }
+
   private isDevOtpPreviewEnabled(): boolean {
-    const nodeEnv =
-      this.configService.get<string>('app.nodeEnv') ??
-      process.env['NODE_ENV'] ??
-      'development';
-    if (nodeEnv === 'production') {
+    if (this.getNodeEnv() === 'production') {
       return false;
     }
     return process.env['ENABLE_DEV_OTP_PREVIEW'] !== 'false';
@@ -173,9 +218,15 @@ export class WardrobeService {
     );
   }
 
-  private maskPhone(phoneE164: string): string {
-    if (phoneE164.length <= 6) return '***';
-    return `${phoneE164.slice(0, 3)}******${phoneE164.slice(-4)}`;
+  private maskDestination(destination: string): string {
+    if (destination.includes('@')) {
+      const [local, domain] = destination.split('@');
+      if (!local || !domain) return '***@***';
+      const prefix = local.slice(0, Math.min(2, local.length));
+      return `${prefix}***@${domain}`;
+    }
+    if (destination.length <= 6) return '***';
+    return `${destination.slice(0, 3)}******${destination.slice(-4)}`;
   }
 
   private async appendUpgradeTrace(
@@ -234,22 +285,80 @@ export class WardrobeService {
       return `+${digitsOnly}`;
     }
     throw new BadRequestException(
-      'Invalid WhatsApp phone number. Enter a valid 10-digit mobile number or E.164 number (e.g. +919876543210).',
+      'Invalid phone number. Enter a valid 10-digit mobile number or E.164 number (e.g. +919876543210).',
     );
   }
 
-  private hashOtp(sessionToken: string, phoneE164: string, otpCode: string): string {
+  normalizeEmail(rawEmail: string): string {
+    if (!rawEmail || typeof rawEmail !== 'string') {
+      throw new BadRequestException('Email address is required.');
+    }
+    const normalized = rawEmail.trim().toLowerCase();
+    if (normalized.length > 160 || !SAFE_EMAIL_REGEX.test(normalized)) {
+      throw new BadRequestException('Invalid email address format.');
+    }
+    return normalized;
+  }
+
+  resolveSafeReturnUrl(rawReturnUrl?: string | null): string {
+    if (!rawReturnUrl || typeof rawReturnUrl !== 'string') {
+      return '/my-wardrobe';
+    }
+    const trimmed = rawReturnUrl.trim();
+    if (
+      !trimmed.startsWith('/') ||
+      trimmed.startsWith('//') ||
+      trimmed.startsWith('/\\') ||
+      trimmed.includes('://') ||
+      trimmed.startsWith('/login')
+    ) {
+      return '/my-wardrobe';
+    }
+    return trimmed;
+  }
+
+  private resolveChannelAndDestination(dto: {
+    channel?: OtpChannel;
+    phone?: string;
+    email?: string;
+  }): { channel: OtpChannel; destination: string; phoneE164?: string; email?: string } {
+    const channel: OtpChannel =
+      dto.channel ?? (dto.email && !dto.phone ? 'email' : 'whatsapp');
+
+    if (channel === 'email') {
+      const email = this.normalizeEmail(dto.email ?? '');
+      return { channel, destination: email, email };
+    }
+
+    const phoneE164 = this.normalizePhoneE164(dto.phone ?? '');
+    return { channel, destination: phoneE164, phoneE164 };
+  }
+
+  private hashOtp(
+    sessionToken: string,
+    channel: OtpChannel,
+    destination: string,
+    otpCode: string,
+  ): string {
+    const payload =
+      channel === 'whatsapp'
+        ? `${sessionToken}:${destination}:${otpCode}`
+        : `${sessionToken}:${channel}:${destination}:${otpCode}`;
     return crypto
       .createHmac('sha256', this.getSigningSecret())
-      .update(`${sessionToken}:${phoneE164}:${otpCode}`)
+      .update(payload)
       .digest('hex');
   }
 
-  signAuthToken(user: { id: string; phoneE164: string }, sessionToken: string): string {
+  signAuthToken(
+    user: { id: string; phoneE164?: string | null; email?: string | null },
+    sessionToken: string,
+  ): string {
     const now = Date.now();
     const payload: SignedAuthTokenPayload = {
       sub: user.id,
-      phoneE164: user.phoneE164,
+      phoneE164: user.phoneE164 ?? null,
+      email: user.email ?? null,
       sessionToken,
       iat: now,
       exp: now + AUTH_TOKEN_TTL_MS,
@@ -324,7 +433,8 @@ export class WardrobeService {
     }
     return {
       id: user.id,
-      phoneE164: user.phoneE164,
+      phoneE164: user.phoneE164 ?? null,
+      email: (user as { email?: string | null }).email ?? null,
       name: user.name ?? null,
       basePersonImageUrl,
       originStoreId: user.originStoreId ?? null,
@@ -333,56 +443,112 @@ export class WardrobeService {
     };
   }
 
-  // ─── 1. Request WhatsApp OTP Challenge ───────────────────────────────────
+  getAuthChannels(): AuthChannelsResponse {
+    return {
+      channels: getAuthChannelCapabilities(this.otpProviders, this.getNodeEnv()),
+      resendCooldownSeconds: OTP_RESEND_COOLDOWN_MS / 1000,
+      otpValiditySeconds: OTP_TTL_MS / 1000,
+    };
+  }
+
+  // ─── 1. Request Multi-Channel OTP Challenge (WhatsApp, SMS, Email) ───────
 
   async requestOtp(
     sessionIdHeader: string | undefined,
     dto: RequestOtpDto,
   ): Promise<RequestOtpResponse> {
     const sessionToken = this.validateSessionToken(sessionIdHeader);
-    const phoneE164 = this.normalizePhoneE164(dto.phone);
+    const { channel, destination, phoneE164 } = this.resolveChannelAndDestination(dto);
+
+    const provider = this.otpProviders[channel];
+    if (!provider || !provider.isEnabled(this.getNodeEnv())) {
+      throw new ServiceUnavailableException(
+        `OTP verification channel '${channel}' is not currently enabled.`,
+      );
+    }
+
+    // Enforce resend cooldown on rapid consecutive requests for the same session & destination
+    const existingSession = await this.db.tryOnSession.findUnique({
+      where: { sessionToken },
+    });
+    const existingRequestedAt = (
+      existingSession as { otpRequestedAt?: Date | null } | null
+    )?.otpRequestedAt;
+    const existingTarget =
+      (existingSession as { otpTarget?: string | null } | null)?.otpTarget ??
+      existingSession?.otpPhoneE164;
+
+    if (
+      existingSession?.otpCodeHash &&
+      existingRequestedAt &&
+      existingTarget === destination &&
+      Date.now() - existingRequestedAt.getTime() < OTP_RESEND_COOLDOWN_MS
+    ) {
+      const remainingSec = Math.ceil(
+        (OTP_RESEND_COOLDOWN_MS - (Date.now() - existingRequestedAt.getTime())) / 1000,
+      );
+      throw new BadRequestException(
+        `Please wait ${remainingSec} seconds before requesting another verification code.`,
+      );
+    }
+
+    const trustedStore = resolveTrustedStoreInfo(dto.storeId);
+    const resolvedStoreId = trustedStore?.storeId ?? null;
+    const resolvedStoreName = trustedStore?.storeName ?? null;
 
     const otpCode = this.isDevOtpPreviewEnabled()
       ? DEV_DEFAULT_OTP
-      : String(crypto.randomInt(100000, 999999));
-    const otpCodeHash = this.hashOtp(sessionToken, phoneE164, otpCode);
-    const otpExpiresAt = new Date(Date.now() + OTP_TTL_MS);
+      : String(crypto.randomInt(100000, 1000000));
+    const otpCodeHash = this.hashOtp(sessionToken, channel, destination, otpCode);
+    const now = new Date();
+    const otpExpiresAt = new Date(now.getTime() + OTP_TTL_MS);
+
+    await provider.sendOtp(destination, otpCode);
 
     await this.db.tryOnSession.upsert({
       where: { sessionToken },
       create: {
         sessionToken,
         status: 'OTP_PENDING',
-        storeId: dto.storeId ?? null,
-        storeName: dto.storeName ?? null,
-        otpPhoneE164: phoneE164,
+        storeId: resolvedStoreId,
+        storeName: resolvedStoreName,
+        otpChannel: channel,
+        otpTarget: destination,
+        otpPhoneE164: phoneE164 ?? destination,
         otpCodeHash,
         otpExpiresAt,
+        otpRequestedAt: now,
         otpAttempts: 0,
       },
       update: {
         status: 'OTP_PENDING',
-        ...(dto.storeId ? { storeId: dto.storeId } : {}),
-        ...(dto.storeName ? { storeName: dto.storeName } : {}),
-        otpPhoneE164: phoneE164,
+        ...(resolvedStoreId ? { storeId: resolvedStoreId } : {}),
+        ...(resolvedStoreName ? { storeName: resolvedStoreName } : {}),
+        otpChannel: channel,
+        otpTarget: destination,
+        otpPhoneE164: phoneE164 ?? destination,
         otpCodeHash,
         otpExpiresAt,
+        otpRequestedAt: now,
         otpAttempts: 0,
       },
     });
 
     await this.appendUpgradeTrace('STEP_0_REQUEST_OTP', sessionToken, {
-      maskedPhone: this.maskPhone(phoneE164),
-      storeId: dto.storeId ?? null,
-      storeName: dto.storeName ?? null,
+      channel,
+      maskedPhone: this.maskDestination(destination),
+      storeId: resolvedStoreId,
+      storeName: resolvedStoreName,
       expiresAt: otpExpiresAt.toISOString(),
     });
 
     return {
       sessionToken,
-      phoneE164,
-      channel: 'whatsapp',
+      channel,
+      destination,
+      phoneE164: phoneE164 ?? destination,
       expiresAt: otpExpiresAt.toISOString(),
+      resendAvailableInSeconds: OTP_RESEND_COOLDOWN_MS / 1000,
       ...(this.isDevOtpPreviewEnabled() ? { devOtpPreview: otpCode } : {}),
     };
   }
@@ -394,10 +560,12 @@ export class WardrobeService {
     dto: UpgradeSessionDto,
   ): Promise<UpgradeSessionResponse> {
     const sessionToken = this.validateSessionToken(sessionIdHeader);
-    const phoneE164 = this.normalizePhoneE164(dto.phone);
+    const { channel, destination, phoneE164, email } =
+      this.resolveChannelAndDestination(dto);
 
     await this.appendUpgradeTrace('STEP_1_VALIDATE_HEADERS_AND_INPUT', sessionToken, {
-      maskedPhone: this.maskPhone(phoneE164),
+      channel,
+      maskedPhone: this.maskDestination(destination),
       requestedJobId: dto.jobId ?? null,
       storeId: dto.storeId ?? null,
     });
@@ -406,7 +574,15 @@ export class WardrobeService {
       where: { sessionToken },
     });
 
-    if (!session || !session.otpCodeHash || !session.otpExpiresAt || !session.otpPhoneE164) {
+    const sessionChannel =
+      ((session as { otpChannel?: string | null } | null)?.otpChannel as
+        | OtpChannel
+        | undefined) ?? 'whatsapp';
+    const sessionTarget =
+      (session as { otpTarget?: string | null } | null)?.otpTarget ??
+      session?.otpPhoneE164;
+
+    if (!session || !session.otpCodeHash || !session.otpExpiresAt || !sessionTarget) {
       await this.appendUpgradeTrace('STEP_2_OTP_CHALLENGE_MISSING', sessionToken, {
         reason: 'No active OTP challenge found for sessionToken',
       });
@@ -431,17 +607,17 @@ export class WardrobeService {
       throw new UnauthorizedException('OTP has expired. Please request a new OTP.');
     }
 
-    if (session.otpPhoneE164 !== phoneE164) {
+    if (sessionTarget !== destination || sessionChannel !== channel) {
       await this.db.tryOnSession.update({
         where: { id: session.id },
         data: { otpAttempts: { increment: 1 } },
       });
       throw new UnauthorizedException(
-        'Phone number does not match the active OTP challenge.',
+        'Verification destination or channel does not match the active OTP challenge.',
       );
     }
 
-    const expectedHash = this.hashOtp(sessionToken, phoneE164, dto.otpCode);
+    const expectedHash = this.hashOtp(sessionToken, channel, destination, dto.otpCode);
     const actualBuf = Buffer.from(session.otpCodeHash, 'utf8');
     const expectedBuf = Buffer.from(expectedHash, 'utf8');
     const isOtpValid =
@@ -459,213 +635,355 @@ export class WardrobeService {
       throw new UnauthorizedException('Invalid OTP code. Please check the 6-digit code.');
     }
 
-    await this.appendUpgradeTrace('STEP_2_OTP_VERIFIED', sessionToken, {
-      maskedPhone: this.maskPhone(phoneE164),
-    });
+    const priorOtpCodeHash = session.otpCodeHash;
+    const priorOtpExpiresAt = session.otpExpiresAt;
+    const priorOtpAttempts = session.otpAttempts;
 
-    // Discover all non-expired jobs created in this browser session
-    const recentCandidates = await this.db.tryOnJob.findMany({
-      orderBy: { createdAt: 'desc' },
-      take: 50,
-    });
-
-    const sessionJobs = recentCandidates.filter(
-      (job) =>
-        job.sessionId === session.id || this.extractJobSessionId(job) === sessionToken,
-    );
-
-    await this.appendUpgradeTrace('STEP_3_DISCOVER_SESSION_JOBS', sessionToken, {
-      discoveredJobsCount: sessionJobs.length,
-      jobIds: sessionJobs.map((j) => j.id),
-    });
-
-    // Pick the best person photo from the target jobId or most recent session job
-    const primaryJob =
-      (dto.jobId ? sessionJobs.find((j) => j.id === dto.jobId) : undefined) ??
-      sessionJobs.find((j) => j.status === 'COMPLETED') ??
-      sessionJobs[0];
-
-    let sourcePersonKey: string | undefined;
-    let sourcePersonMeta: Prisma.InputJsonValue | undefined;
-    if (primaryJob?.personImageKey) {
-      const exists = await this.storage.exists(primaryJob.personImageKey);
-      if (exists) {
-        sourcePersonKey = primaryJob.personImageKey;
-        sourcePersonMeta = (primaryJob.personImageMeta ?? undefined) as
-          | Prisma.InputJsonValue
-          | undefined;
-      }
-    }
-
-    const resolvedStoreId = dto.storeId ?? session.storeId ?? undefined;
-    const resolvedStoreName =
-      dto.storeName ?? session.storeName ?? 'Walk-In Partner Boutique (QR)';
-
-    // Execute atomic DB upgrade transaction with storage decoupling & returning-user protection
-    const {
-      upgradedUser,
-      upgradedJobsCount,
-      isReturningUser,
-      originStoreDecision,
-      basePortraitDecision,
-      copiedFromKey,
-    } = await this.db.$transaction(async (tx) => {
-      const existingUser = await tx.user.findUnique({ where: { phoneE164 } });
-      const returning = Boolean(existingUser);
-
-      // Rule 1: Never overwrite originStoreId or originStoreName if already set on a returning user
-      const preserveExistingStore = Boolean(existingUser?.originStoreId);
-      const nextOriginStoreId = existingUser?.originStoreId ?? resolvedStoreId ?? null;
-      const nextOriginStoreName = existingUser?.originStoreName ?? resolvedStoreName;
-      const storeDecision = preserveExistingStore
-        ? 'PRESERVED_EXISTING_ORIGIN_STORE'
-        : 'SET_FIRST_TOUCH_ORIGIN_STORE';
-
-      // Upsert User record first so we have a guaranteed user.id UUID for user-scoped storage
-      let user = await tx.user.upsert({
-        where: { phoneE164 },
-        create: {
-          phoneE164,
-          phoneVerifiedAt: new Date(),
-          basePersonImageKey: null,
-          basePersonImageMeta: undefined,
-          originStoreId: nextOriginStoreId,
-          originStoreName: nextOriginStoreName,
+    // Atomically claim the OTP hash in PostgreSQL before entering the transaction to block concurrent replay across API instances
+    if (typeof this.db.tryOnSession.updateMany === 'function') {
+      const claimed = await this.db.tryOnSession.updateMany({
+        where: {
+          id: session.id,
+          otpCodeHash: session.otpCodeHash,
         },
-        update: {
-          phoneVerifiedAt: new Date(),
-          ...(!existingUser?.originStoreId && nextOriginStoreId
-            ? { originStoreId: nextOriginStoreId }
-            : {}),
-          ...(!existingUser?.originStoreName && nextOriginStoreName
-            ? { originStoreName: nextOriginStoreName }
-            : {}),
-        },
-      });
-
-      // Rule 2: Decouple storage into `users/<userId>/base_portrait.<ext>` and protect returning users' base portrait
-      const existingKey = existingUser?.basePersonImageKey ?? null;
-      const hasValidUserScopedPortrait = Boolean(
-        existingKey &&
-          existingKey.startsWith('users/') &&
-          (await this.storage.exists(existingKey)),
-      );
-      const explicitReplace = Boolean(dto.replaceBasePortrait);
-
-      let portraitDecision = 'NO_SOURCE_PORTRAIT_AVAILABLE';
-      let copiedSource: string | null = null;
-
-      if (hasValidUserScopedPortrait && !explicitReplace) {
-        portraitDecision = 'RETAINED_EXISTING_USER_PORTRAIT';
-      } else if (sourcePersonKey) {
-        const decoupledKey = await this.copyPortraitToUserStorage(
-          user.id,
-          sourcePersonKey,
-          sourcePersonMeta,
-        );
-        user = await tx.user.update({
-          where: { id: user.id },
-          data: {
-            basePersonImageKey: decoupledKey,
-            ...(sourcePersonMeta ? { basePersonImageMeta: sourcePersonMeta } : {}),
-          },
-        });
-        copiedSource = sourcePersonKey;
-        portraitDecision = explicitReplace
-          ? 'EXPLICITLY_REPLACED_AND_COPIED_TO_USER_STORAGE'
-          : 'COPIED_JOB_PORTRAIT_TO_USER_STORAGE';
-      } else if (
-        existingKey &&
-        existingKey.startsWith('jobs/') &&
-        (await this.storage.exists(existingKey))
-      ) {
-        // Self-heal legacy job-bound pointer into user-scoped storage
-        const migratedKey = await this.copyPortraitToUserStorage(
-          user.id,
-          existingKey,
-          existingUser?.basePersonImageMeta,
-        );
-        user = await tx.user.update({
-          where: { id: user.id },
-          data: { basePersonImageKey: migratedKey },
-        });
-        copiedSource = existingKey;
-        portraitDecision = 'MIGRATED_LEGACY_JOB_KEY_TO_USER_STORAGE';
-      }
-
-      await tx.tryOnSession.update({
-        where: { id: session.id },
         data: {
-          status: 'UPGRADED',
-          userId: user.id,
-          upgradedAt: new Date(),
-          storeId: resolvedStoreId ?? session.storeId,
-          storeName: resolvedStoreName,
           otpCodeHash: null,
           otpExpiresAt: null,
           otpAttempts: 0,
         },
       });
+      if (!claimed || claimed.count === 0) {
+        throw new UnauthorizedException(
+          'This verification code has already been used. Please request a new OTP.',
+        );
+      }
+    }
 
-      const jobIdsToUpgrade = sessionJobs.map((j) => j.id);
-      let updatedCount = 0;
-      if (jobIdsToUpgrade.length > 0) {
-        const res = await tx.tryOnJob.updateMany({
-          where: { id: { in: jobIdsToUpgrade } },
-          data: {
-            userId: user.id,
-            sessionId: session.id,
-            savedToWardrobe: true,
-            retailerSource: resolvedStoreName,
-            // Clear 7-day anonymous TTL so saved wardrobe looks never expire
-            expiresAt: null,
-          },
-        });
-        updatedCount = res.count;
+    try {
+      await this.appendUpgradeTrace('STEP_2_OTP_VERIFIED', sessionToken, {
+        channel,
+        maskedPhone: this.maskDestination(destination),
+      });
+
+      // Discover all non-expired jobs created in this browser session (scoped in PostgreSQL before take: 50)
+      const recentCandidates = await this.db.tryOnJob.findMany({
+        where: {
+          OR: [
+            { sessionId: session.id },
+            {
+              personImageMeta: {
+                path: ['sessionId'],
+                equals: sessionToken,
+              },
+            },
+            {
+              garmentImageMeta: {
+                path: ['sessionId'],
+                equals: sessionToken,
+              },
+            },
+            ...(dto.jobId && isUuid(dto.jobId) ? [{ id: dto.jobId }] : []),
+          ],
+        } as Prisma.TryOnJobWhereInput,
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      });
+
+      const sessionJobs = recentCandidates.filter(
+        (job) =>
+          (job.sessionId === session.id || this.extractJobSessionId(job) === sessionToken) &&
+          (!job.userId || (session.userId && job.userId === session.userId)),
+      );
+
+      await this.appendUpgradeTrace('STEP_3_DISCOVER_SESSION_JOBS', sessionToken, {
+        discoveredJobsCount: sessionJobs.length,
+        jobIds: sessionJobs.map((j) => j.id),
+      });
+
+      // Pick the best person photo from the target jobId or most recent session job
+      const primaryJob =
+        (dto.jobId ? sessionJobs.find((j) => j.id === dto.jobId) : undefined) ??
+        sessionJobs.find((j) => j.status === 'COMPLETED') ??
+        sessionJobs[0];
+
+      let sourcePersonKey: string | undefined;
+      let sourcePersonMeta: Prisma.InputJsonValue | undefined;
+      if (primaryJob?.personImageKey) {
+        const exists = await this.storage.exists(primaryJob.personImageKey);
+        if (exists) {
+          sourcePersonKey = primaryJob.personImageKey;
+          sourcePersonMeta = (primaryJob.personImageMeta ?? undefined) as
+            | Prisma.InputJsonValue
+            | undefined;
+        }
       }
 
+      // Resolve store context against trusted server-side partner store registry
+      const trustedStore = resolveTrustedStoreInfo(dto.storeId ?? session.storeId);
+      const resolvedStoreId = trustedStore?.storeId ?? undefined;
+      const resolvedStoreName =
+        trustedStore?.storeName ?? 'Walk-In Partner Boutique (QR)';
+
+      // Execute atomic DB upgrade transaction with storage decoupling & returning-user protection
+      const {
+        upgradedUser,
+        upgradedJobsCount,
+        isReturningUser,
+        originStoreDecision,
+        basePortraitDecision,
+        copiedFromKey,
+      } = await this.db.$transaction(async (tx) => {
+        // Look up existing user by verified phone or verified email, or existing session.userId (account linking)
+        let existingUser: User | null = null;
+        if (phoneE164) {
+          existingUser = await tx.user.findUnique({ where: { phoneE164 } });
+        }
+        if (!existingUser && email) {
+          existingUser = await tx.user.findUnique({
+            where: { email } as Prisma.UserWhereUniqueInput,
+          });
+        }
+        if (!existingUser && session.userId) {
+          existingUser = await tx.user.findUnique({ where: { id: session.userId } });
+        }
+
+        const returning = Boolean(existingUser);
+
+        // Rule 1: Never overwrite originStoreId or originStoreName if already set on a returning user
+        const preserveExistingStore = Boolean(existingUser?.originStoreId);
+        const nextOriginStoreId = existingUser?.originStoreId ?? resolvedStoreId ?? null;
+        const nextOriginStoreName = existingUser?.originStoreName ?? resolvedStoreName;
+        const storeDecision = preserveExistingStore
+          ? 'PRESERVED_EXISTING_ORIGIN_STORE'
+          : 'SET_FIRST_TOUCH_ORIGIN_STORE';
+
+        let user: User;
+        if (phoneE164 && (!existingUser || existingUser.phoneE164 === phoneE164)) {
+          user = await tx.user.upsert({
+            where: { phoneE164 },
+            create: {
+              phoneE164,
+              phoneVerifiedAt: new Date(),
+              basePersonImageKey: null,
+              basePersonImageMeta: undefined,
+              originStoreId: nextOriginStoreId,
+              originStoreName: nextOriginStoreName,
+            },
+            update: {
+              phoneVerifiedAt: new Date(),
+              ...(!existingUser?.originStoreId && nextOriginStoreId
+                ? { originStoreId: nextOriginStoreId }
+                : {}),
+              ...(!existingUser?.originStoreName && nextOriginStoreName
+                ? { originStoreName: nextOriginStoreName }
+                : {}),
+            },
+          });
+        } else if (existingUser) {
+          user = await tx.user.update({
+            where: { id: existingUser.id },
+            data: {
+              ...(phoneE164 ? { phoneE164, phoneVerifiedAt: new Date() } : {}),
+              ...(email ? { email, emailVerifiedAt: new Date() } : {}),
+              ...(!existingUser.originStoreId && nextOriginStoreId
+                ? { originStoreId: nextOriginStoreId }
+                : {}),
+              ...(!existingUser.originStoreName && nextOriginStoreName
+                ? { originStoreName: nextOriginStoreName }
+                : {}),
+            } as Prisma.UserUpdateInput,
+          });
+        } else {
+          user = await tx.user.upsert({
+            where: { email: email! } as Prisma.UserWhereUniqueInput,
+            create: {
+              email: email!,
+              emailVerifiedAt: new Date(),
+              phoneE164: null,
+              basePersonImageKey: null,
+              basePersonImageMeta: undefined,
+              originStoreId: nextOriginStoreId,
+              originStoreName: nextOriginStoreName,
+            } as Prisma.UserCreateInput,
+            update: {
+              emailVerifiedAt: new Date(),
+            } as Prisma.UserUpdateInput,
+          });
+        }
+
+        // Rule 2: Decouple storage into `users/<userId>/base_portrait.<ext>` and protect returning users' base portrait
+        const existingKey = existingUser?.basePersonImageKey ?? null;
+        const hasValidUserScopedPortrait = Boolean(
+          existingKey &&
+            existingKey.startsWith('users/') &&
+            (await this.storage.exists(existingKey)),
+        );
+        const explicitReplace = Boolean(dto.replaceBasePortrait);
+
+        let portraitDecision = 'NO_SOURCE_PORTRAIT_AVAILABLE';
+        let copiedSource: string | null = null;
+
+        if (hasValidUserScopedPortrait && !explicitReplace) {
+          portraitDecision = 'RETAINED_EXISTING_USER_PORTRAIT';
+        } else if (sourcePersonKey) {
+          const decoupledKey = await this.copyPortraitToUserStorage(
+            user.id,
+            sourcePersonKey,
+            sourcePersonMeta,
+          );
+          user = await tx.user.update({
+            where: { id: user.id },
+            data: {
+              basePersonImageKey: decoupledKey,
+              ...(sourcePersonMeta ? { basePersonImageMeta: sourcePersonMeta } : {}),
+            },
+          });
+          copiedSource = sourcePersonKey;
+          portraitDecision = explicitReplace
+            ? 'EXPLICITLY_REPLACED_AND_COPIED_TO_USER_STORAGE'
+            : 'COPIED_JOB_PORTRAIT_TO_USER_STORAGE';
+        } else if (
+          existingKey &&
+          existingKey.startsWith('jobs/') &&
+          (await this.storage.exists(existingKey))
+        ) {
+          // Self-heal legacy job-bound pointer into user-scoped storage
+          const migratedKey = await this.copyPortraitToUserStorage(
+            user.id,
+            existingKey,
+            existingUser?.basePersonImageMeta,
+          );
+          user = await tx.user.update({
+            where: { id: user.id },
+            data: { basePersonImageKey: migratedKey },
+          });
+          copiedSource = existingKey;
+          portraitDecision = 'MIGRATED_LEGACY_JOB_KEY_TO_USER_STORAGE';
+        }
+
+        await tx.tryOnSession.update({
+          where: { id: session.id },
+          data: {
+            status: 'UPGRADED',
+            userId: user.id,
+            upgradedAt: new Date(),
+            storeId: resolvedStoreId ?? session.storeId,
+            storeName: resolvedStoreName,
+            otpCodeHash: null,
+            otpExpiresAt: null,
+            otpAttempts: 0,
+          },
+        });
+
+        const completedJobIds = sessionJobs
+          .filter((j) => j.status === 'COMPLETED')
+          .map((j) => j.id);
+        const nonCompletedJobIds = sessionJobs
+          .filter((j) => j.status !== 'COMPLETED')
+          .map((j) => j.id);
+        let updatedCount = 0;
+        if (completedJobIds.length > 0) {
+          const res = await tx.tryOnJob.updateMany({
+            where: { id: { in: completedJobIds } },
+            data: {
+              userId: user.id,
+              sessionId: session.id,
+              savedToWardrobe: true,
+              retailerSource: resolvedStoreName,
+              // Clear 7-day anonymous TTL so saved wardrobe looks never expire
+              expiresAt: null,
+            },
+          });
+          updatedCount += res.count;
+        }
+        if (nonCompletedJobIds.length > 0) {
+          await tx.tryOnJob.updateMany({
+            where: { id: { in: nonCompletedJobIds } },
+            data: {
+              userId: user.id,
+              sessionId: session.id,
+              savedToWardrobe: false,
+              retailerSource: resolvedStoreName,
+              // Preserve expiresAt so failed/uncompleted temporary assets are cleaned up
+            },
+          });
+        }
+
+        return {
+          upgradedUser: user,
+          upgradedJobsCount: updatedCount,
+          isReturningUser: returning,
+          originStoreDecision: storeDecision,
+          basePortraitDecision: portraitDecision,
+          copiedFromKey: copiedSource,
+        };
+      });
+
+      if (this.usageEntitlementService) {
+        await this.usageEntitlementService
+          .migrateAnonymousEntitlementOnUpgrade(sessionToken, upgradedUser.id)
+          .catch((err) => {
+            this.logger.warn(
+              `Non-fatal anonymous entitlement migration warning for user ${upgradedUser.id}: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          });
+      }
+
+      await this.appendUpgradeTrace('STEP_4_USER_UPSERTED_AND_BASE_PHOTO_PROMOTED', sessionToken, {
+        userId: upgradedUser.id,
+        isReturningUser,
+        originStoreDecision,
+        originStoreId: upgradedUser.originStoreId,
+        originStoreName: upgradedUser.originStoreName,
+        currentVisitStoreId: resolvedStoreId ?? null,
+        currentVisitStoreName: resolvedStoreName,
+        basePortraitDecision,
+        copiedFromKey,
+        basePersonImageKey: upgradedUser.basePersonImageKey,
+      });
+
+      await this.appendUpgradeTrace('STEP_5_SESSION_AND_JOBS_UPGRADED', sessionToken, {
+        userId: upgradedUser.id,
+        upgradedJobsCount,
+        ttlCleared: true,
+      });
+
+      const authToken = this.signAuthToken(upgradedUser, sessionToken);
+      const safeRedirect = this.resolveSafeReturnUrl(dto.returnUrl);
+
+      await this.appendUpgradeTrace('STEP_6_AUTH_TOKEN_MINTED', sessionToken, {
+        userId: upgradedUser.id,
+        redirectTo: safeRedirect,
+      });
+
       return {
-        upgradedUser: user,
-        upgradedJobsCount: updatedCount,
-        isReturningUser: returning,
-        originStoreDecision: storeDecision,
-        basePortraitDecision: portraitDecision,
-        copiedFromKey: copiedSource,
+        authToken,
+        user: await this.toUserProfileDto(upgradedUser),
+        upgradedJobsCount,
+        redirectTo: safeRedirect,
       };
-    });
-
-    await this.appendUpgradeTrace('STEP_4_USER_UPSERTED_AND_BASE_PHOTO_PROMOTED', sessionToken, {
-      userId: upgradedUser.id,
-      isReturningUser,
-      originStoreDecision,
-      originStoreId: upgradedUser.originStoreId,
-      originStoreName: upgradedUser.originStoreName,
-      currentVisitStoreId: resolvedStoreId ?? null,
-      currentVisitStoreName: resolvedStoreName,
-      basePortraitDecision,
-      copiedFromKey,
-      basePersonImageKey: upgradedUser.basePersonImageKey,
-    });
-
-    await this.appendUpgradeTrace('STEP_5_SESSION_AND_JOBS_UPGRADED', sessionToken, {
-      userId: upgradedUser.id,
-      upgradedJobsCount,
-      ttlCleared: true,
-    });
-
-    const authToken = this.signAuthToken(upgradedUser, sessionToken);
-
-    await this.appendUpgradeTrace('STEP_6_AUTH_TOKEN_MINTED', sessionToken, {
-      userId: upgradedUser.id,
-      redirectTo: '/my-wardrobe',
-    });
-
-    return {
-      authToken,
-      user: await this.toUserProfileDto(upgradedUser),
-      upgradedJobsCount,
-      redirectTo: '/my-wardrobe',
-    };
+    } catch (err) {
+      // Restore claimed OTP hash if a transient storage or DB error prevented upgrade completion
+      if (typeof this.db.tryOnSession.updateMany === 'function') {
+        await this.db.tryOnSession
+          .updateMany({
+            where: {
+              id: session.id,
+              status: { not: 'UPGRADED' },
+              otpCodeHash: null,
+            },
+            data: {
+              otpCodeHash: priorOtpCodeHash,
+              otpExpiresAt: priorOtpExpiresAt,
+              otpAttempts: priorOtpAttempts,
+            },
+          })
+          .catch(() => undefined);
+      }
+      throw err;
+    }
   }
 
   private resolvePortraitExtension(
@@ -706,14 +1024,28 @@ export class WardrobeService {
     return destKey;
   }
 
-  // ─── 3. Resolve Authenticated User (Bearer Token or Upgraded Session) ────
+  // ─── 3. Resolve Authenticated User (Bearer Token, Cookie, or Upgraded Session) ──
+
+  assertNotShopkeeperHeader(partnerStoreId?: string, partnerKey?: string): void {
+    if (partnerStoreId || partnerKey) {
+      throw new ForbiddenException(
+        'Shopkeeper credentials are not permitted to access customer wardrobe, portraits, or private account data.',
+      );
+    }
+  }
 
   async resolveAuthenticatedUser(
     authorizationHeader?: string,
     authTokenHeader?: string,
     sessionIdHeader?: string,
+    cookieHeader?: string,
+    partnerStoreId?: string,
+    partnerKey?: string,
   ): Promise<{ user: User; sessionToken?: string }> {
-    const tokenCandidate = authTokenHeader ?? authorizationHeader;
+    this.assertNotShopkeeperHeader(partnerStoreId, partnerKey);
+
+    const cookieToken = extractAuthTokenFromCookieHeader(cookieHeader);
+    const tokenCandidate = authTokenHeader ?? authorizationHeader ?? cookieToken;
     const verifiedPayload = this.verifyAuthToken(tokenCandidate);
 
     if (verifiedPayload) {
@@ -737,7 +1069,7 @@ export class WardrobeService {
     }
 
     throw new UnauthorizedException(
-      'Wardrobe access requires a verified WhatsApp session. Upgrade your try-on session or sign in with OTP.',
+      'Wardrobe access requires a verified account session. Upgrade your try-on session or sign in with OTP.',
     );
   }
 
@@ -747,14 +1079,20 @@ export class WardrobeService {
     authorizationHeader?: string,
     authTokenHeader?: string,
     sessionIdHeader?: string,
+    cookieHeader?: string,
+    partnerStoreId?: string,
+    partnerKey?: string,
   ): Promise<WardrobeResponse> {
     const { user } = await this.resolveAuthenticatedUser(
       authorizationHeader,
       authTokenHeader,
       sessionIdHeader,
+      cookieHeader,
+      partnerStoreId,
+      partnerKey,
     );
 
-    const savedJobs = await this.db.tryOnJob.findMany({
+    const queriedJobs = await this.db.tryOnJob.findMany({
       where: {
         userId: user.id,
         savedToWardrobe: true,
@@ -762,6 +1100,10 @@ export class WardrobeService {
       orderBy: { createdAt: 'desc' },
       take: 24,
     });
+
+    const savedJobs = queriedJobs.filter(
+      (job) => job.userId === user.id && Boolean(job.savedToWardrobe),
+    );
 
     const dtos = await Promise.all(
       savedJobs.map((job) => this.tryOnService.jobToStatusDto(job)),
@@ -800,11 +1142,13 @@ export class WardrobeService {
     authorizationHeader?: string,
     authTokenHeader?: string,
     sessionIdHeader?: string,
+    cookieHeader?: string,
   ): Promise<JobStatusResponseDto> {
     const { user, sessionToken } = await this.resolveAuthenticatedUser(
       authorizationHeader,
       authTokenHeader,
       sessionIdHeader,
+      cookieHeader,
     );
 
     const job = await this.db.tryOnJob.findUnique({ where: { id: jobId } });
@@ -815,13 +1159,25 @@ export class WardrobeService {
     const jobOwnerSession = this.extractJobSessionId(job);
     const callerSession = sessionIdHeader?.trim() ?? sessionToken;
     if (
-      job.userId &&
-      job.userId !== user.id &&
-      jobOwnerSession &&
-      jobOwnerSession !== callerSession
+      (job.userId && job.userId !== user.id) ||
+      (!job.userId && jobOwnerSession && jobOwnerSession !== callerSession)
     ) {
       throw new UnauthorizedException('You do not own this try-on job.');
     }
+
+    const jobWithBilling = job as typeof job & {
+      billingMode?: string | null;
+      sponsoredStoreId?: string | null;
+      storeId?: string | null;
+    };
+    const isStoreSponsored =
+      jobWithBilling.billingMode === 'STORE_SPONSORED' ||
+      Boolean(jobWithBilling.sponsoredStoreId || jobWithBilling.storeId);
+    const storeFallbackName = isStoreSponsored
+      ? (resolveTrustedStoreInfo(
+          jobWithBilling.sponsoredStoreId ?? jobWithBilling.storeId ?? undefined,
+        )?.storeName ?? 'Partner Boutique')
+      : 'Personal WearMe';
 
     const updated = await this.db.tryOnJob.update({
       where: { id: job.id },
@@ -829,7 +1185,7 @@ export class WardrobeService {
         userId: user.id,
         savedToWardrobe: true,
         expiresAt: null,
-        retailerSource: job.retailerSource ?? user.originStoreName ?? 'Try-On Studio',
+        retailerSource: job.retailerSource ?? storeFallbackName,
       },
     });
 
@@ -866,7 +1222,6 @@ export class WardrobeService {
   // ─── 6. 1-Click Cross-Retailer Try-On Using Saved Base Portrait ──────────
 
   private async renderCatalogGarmentPng(item: RetailerCatalogItem): Promise<Buffer> {
-    // Parse accent color hex -> RGB
     const hex = item.accentColor.replace('#', '');
     const r = parseInt(hex.slice(0, 2), 16) || 59;
     const g = parseInt(hex.slice(2, 4), 16) || 130;
@@ -888,11 +1243,13 @@ export class WardrobeService {
     authorizationHeader?: string,
     authTokenHeader?: string,
     sessionIdHeader?: string,
+    cookieHeader?: string,
   ): Promise<JobStatusResponseDto> {
     const { user, sessionToken } = await this.resolveAuthenticatedUser(
       authorizationHeader,
       authTokenHeader,
       sessionIdHeader,
+      cookieHeader,
     );
 
     const catalogItem = CROSS_RETAILER_CATALOG.find(
@@ -936,6 +1293,10 @@ export class WardrobeService {
       this.storage.upload(garmentKey, garmentBuffer, 'image/png'),
     ]);
 
+    const hasExtendedSchema = Boolean(
+      (this.db as unknown as Record<string, unknown>)['usageReservation'],
+    );
+
     await this.db.tryOnJob.create({
       data: {
         id: jobId,
@@ -948,6 +1309,13 @@ export class WardrobeService {
         retailerSource: catalogItem.brand,
         productTitle: catalogItem.title,
         expiresAt: null,
+        ...(hasExtendedSchema
+          ? {
+              billingMode: 'PERSONAL',
+              sponsoredStoreId: null,
+              storeId: null,
+            }
+          : {}),
         personImageMeta: {
           mimeType: 'image/jpeg',
           reusedFromWardrobeBasePhoto: true,
@@ -960,16 +1328,272 @@ export class WardrobeService {
           catalogItemId: catalogItem.id,
           brand: catalogItem.brand,
           title: catalogItem.title,
+          billingMode: 'PERSONAL',
           ...(effectiveSessionId ? { sessionId: effectiveSessionId } : {}),
         },
-      },
+      } as unknown as Prisma.TryOnJobUncheckedCreateInput,
     });
 
-    await this.tryOnService.processJob(jobId, effectiveSessionId);
+    await this.tryOnService.processJob(jobId, effectiveSessionId, user.id);
     const completedJob = await this.db.tryOnJob.findUnique({ where: { id: jobId } });
     if (!completedJob) {
       throw new NotFoundException(`Generated wardrobe job not found: ${jobId}`);
     }
     return this.tryOnService.jobToStatusDto(completedJob);
+  }
+
+  // ─── 7. Privacy Operations (Portrait Deletion, Account Deletion, Logout) ──
+
+  async deleteUserPortrait(
+    authorizationHeader?: string,
+    authTokenHeader?: string,
+    sessionIdHeader?: string,
+    cookieHeader?: string,
+    partnerStoreId?: string,
+    partnerKey?: string,
+  ): Promise<DeletePortraitResponse> {
+    const { user } = await this.resolveAuthenticatedUser(
+      authorizationHeader,
+      authTokenHeader,
+      sessionIdHeader,
+      cookieHeader,
+      partnerStoreId,
+      partnerKey,
+    );
+
+    if (user.basePersonImageKey) {
+      await this.storage.delete(user.basePersonImageKey).catch(() => undefined);
+    }
+
+    await this.db.user.update({
+      where: { id: user.id },
+      data: {
+        basePersonImageKey: null,
+      },
+    });
+
+    return {
+      deleted: true,
+      userId: user.id,
+    };
+  }
+
+  async deleteUserAccount(
+    authorizationHeader?: string,
+    authTokenHeader?: string,
+    sessionIdHeader?: string,
+    cookieHeader?: string,
+    partnerStoreId?: string,
+    partnerKey?: string,
+  ): Promise<DeleteAccountResponse> {
+    const { user, sessionToken } = await this.resolveAuthenticatedUser(
+      authorizationHeader,
+      authTokenHeader,
+      sessionIdHeader,
+      cookieHeader,
+      partnerStoreId,
+      partnerKey,
+    );
+
+    if (user.basePersonImageKey) {
+      await this.storage.delete(user.basePersonImageKey).catch(() => undefined);
+    }
+
+    const queriedJobs = await this.db.tryOnJob.findMany({
+      where: { userId: user.id },
+    });
+    const userJobs = queriedJobs.filter((j) => j.userId === user.id);
+
+    for (const job of userJobs) {
+      await Promise.allSettled([
+        this.storage.delete(job.personImageKey),
+        this.storage.delete(job.garmentImageKey),
+        ...(job.resultImageKey ? [this.storage.delete(job.resultImageKey)] : []),
+        this.storage.deleteJobDirectory(job.id),
+      ]);
+      if (this.db.tryOnJob.delete) {
+        await this.db.tryOnJob.delete({ where: { id: job.id } }).catch(() => undefined);
+      }
+    }
+
+    // Purge TryOnSession records containing user linkage or OTP PII before deleting user
+    const sessionConditions: Record<string, unknown>[] = [{ userId: user.id }];
+    if (sessionIdHeader && SAFE_SESSION_ID_REGEX.test(sessionIdHeader.trim())) {
+      sessionConditions.push({ sessionToken: sessionIdHeader.trim() });
+    }
+    if (sessionToken) {
+      sessionConditions.push({ sessionToken });
+    }
+    if (user.phoneE164) {
+      sessionConditions.push({ otpPhoneE164: user.phoneE164 });
+      sessionConditions.push({ otpTarget: user.phoneE164 });
+    }
+    if (user.email) {
+      sessionConditions.push({ otpTarget: user.email });
+    }
+    const tryOnSessionDelegate = this.db.tryOnSession as unknown as {
+      deleteMany?: (args: unknown) => Promise<unknown>;
+    };
+    if (typeof tryOnSessionDelegate?.deleteMany === 'function') {
+      await tryOnSessionDelegate
+        .deleteMany({ where: { OR: sessionConditions } })
+        .catch(() => undefined);
+    }
+
+    if (this.db.user.delete) {
+      await this.db.user.delete({ where: { id: user.id } }).catch(() => undefined);
+    }
+
+    return {
+      deleted: true,
+      userId: user.id,
+      deletedJobsCount: userJobs.length,
+    };
+  }
+
+  async logoutSession(sessionIdHeader?: string): Promise<{ loggedOut: boolean }> {
+    if (sessionIdHeader && SAFE_SESSION_ID_REGEX.test(sessionIdHeader.trim())) {
+      const sessionToken = sessionIdHeader.trim();
+      const existing = await this.db.tryOnSession.findUnique({
+        where: { sessionToken },
+      });
+      if (existing) {
+        await this.db.tryOnSession.update({
+          where: { id: existing.id },
+          data: {
+            status: 'ANONYMOUS',
+            userId: null,
+            otpCodeHash: null,
+            otpExpiresAt: null,
+          },
+        });
+      }
+    }
+    return { loggedOut: true };
+  }
+
+  // ─── 8. Partner Store Registry & Aggregated Analytics (No Customer Data) ──
+
+  getPublicStoreInfo(rawStoreId: string): PartnerStorePublicInfo {
+    const info = resolveTrustedStoreInfo(rawStoreId);
+    if (!info) {
+      throw new BadRequestException(
+        'Invalid storeId format. Expected 2-64 alphanumeric, underscore, or hyphen characters.',
+      );
+    }
+    return info;
+  }
+
+  async getPartnerStoreAnalytics(
+    rawStoreId: string,
+    partnerStoreIdHeader?: string,
+  ): Promise<PartnerStoreAnalyticsResponse> {
+    const info = this.getPublicStoreInfo(rawStoreId);
+    if (
+      partnerStoreIdHeader &&
+      partnerStoreIdHeader.trim() &&
+      partnerStoreIdHeader.trim() !== info.storeId
+    ) {
+      throw new ForbiddenException(
+        `Cross-store access denied: partner credentials for '${partnerStoreIdHeader.trim()}' cannot access '${info.storeId}'.`,
+      );
+    }
+
+    const allJobs = await this.db.tryOnJob.findMany({
+      where: {
+        OR: [
+          { sponsoredStoreId: info.storeId },
+          { storeId: info.storeId },
+          { retailerSource: info.storeName },
+        ],
+      } as Prisma.TryOnJobWhereInput,
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+    });
+
+    const matchingJobs = allJobs.filter((j) => {
+      const jb = j as typeof j & { sponsoredStoreId?: string | null; storeId?: string | null };
+      return (
+        jb.sponsoredStoreId === info.storeId ||
+        jb.storeId === info.storeId ||
+        j.retailerSource === info.storeName
+      );
+    });
+
+    return {
+      storeId: info.storeId,
+      storeName: info.storeName,
+      totalTryOnSessions: matchingJobs.length,
+      totalTryOnJobs: matchingJobs.length,
+      completedTryOnJobs: matchingJobs.filter((j) => j.status === 'COMPLETED').length,
+      savedToWardrobeCount: matchingJobs.filter((j) => Boolean(j.savedToWardrobe)).length,
+      firstTouchAttributedUsersCount: new Set(
+        matchingJobs.map((j) => j.userId).filter(Boolean),
+      ).size,
+      privacyNotice:
+        'Aggregated operational metrics only. Customer portraits, generated try-on images, private wardrobes, and personal contact details are strictly isolated and inaccessible to shop partners.',
+    };
+  }
+
+  // ─── 9. Server-Validated Contact / Privacy / Security Inquiry Handler ─────
+
+  async submitContactInquiry(dto: ContactInquiryDto): Promise<ContactInquiryResponse> {
+    const inquiryId = uuidv4();
+    const receivedAt = new Date().toISOString();
+    const normalizedEmail = this.normalizeEmail(dto.email);
+
+    let deliveryMode: 'logged_local_queue' | 'webhook_forwarded' = 'logged_local_queue';
+    if (process.env['CONTACT_INQUIRY_WEBHOOK_URL']) {
+      try {
+        await axios.post(
+          process.env['CONTACT_INQUIRY_WEBHOOK_URL'],
+          {
+            inquiryId,
+            category: dto.category,
+            name: dto.name.trim(),
+            email: normalizedEmail,
+            organization: dto.organization?.trim() ?? null,
+            message: dto.message.trim(),
+            receivedAt,
+          },
+          { timeout: 5000 },
+        );
+        deliveryMode = 'webhook_forwarded';
+      } catch {
+        deliveryMode = 'logged_local_queue';
+      }
+    }
+
+    const logPath = path.resolve(process.cwd(), 'uploads', 'contact-inquiries.jsonl');
+    try {
+      await fs.mkdir(path.dirname(logPath), { recursive: true });
+      await fs.appendFile(
+        logPath,
+        `${JSON.stringify({
+          inquiryId,
+          category: dto.category,
+          name: dto.name.trim(),
+          email: normalizedEmail,
+          organization: dto.organization?.trim() ?? null,
+          messageLength: dto.message.trim().length,
+          receivedAt,
+          deliveryMode,
+        })}\n`,
+        'utf8',
+      );
+    } catch {
+      // Non-fatal in read-only environments
+    }
+
+    return {
+      inquiryId,
+      category: dto.category,
+      receivedAt,
+      deliveryMode,
+      notice:
+        deliveryMode === 'webhook_forwarded'
+          ? 'Your inquiry has been recorded and forwarded to the configured team webhook.'
+          : 'Your inquiry has been validated and recorded in the server inquiry queue (SMTP/webhook delivery is not configured in this environment).',
+    };
   }
 }
